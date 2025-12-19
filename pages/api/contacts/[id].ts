@@ -1,6 +1,15 @@
 import clientPromise from '../../../lib/mongo';
 import { ObjectId } from 'mongodb';
 
+function normalizeSegments(input: any): string[] {
+  if (!input) return [];
+  if (Array.isArray(input)) return input.map(String).map(s => s.trim()).filter(Boolean);
+  return String(input)
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 export default async function handler(req, res) {
   const client = await clientPromise;
   const db = client.db('PlatformData');
@@ -9,13 +18,21 @@ export default async function handler(req, res) {
   if (!id) return res.status(400).json({ error: 'No ID provided' });
 
   if (req.method === 'PUT') {
-    const { _id, ...updateData } = req.body; // exclude _id
+    const { _id, segments, ...updateData } = req.body;
+
+    if (segments !== undefined) {
+      updateData.segments = normalizeSegments(segments);
+    }
+
     try {
       const result = await db.collection('contacts').updateOne(
         { _id: new ObjectId(id as string) },
         { $set: updateData }
       );
-      if (result.matchedCount === 0) return res.status(404).json({ error: 'Contact not found' });
+
+      if (result.matchedCount === 0)
+        return res.status(404).json({ error: 'Contact not found' });
+
       res.status(200).json({ success: true });
     } catch (err) {
       res.status(500).json({ error: err.message });

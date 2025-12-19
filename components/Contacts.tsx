@@ -1,72 +1,109 @@
-import Link from 'next/link';
 import { useEffect, useState } from 'react';
 
 type Contact = {
-  _id: string;
-  name?: string;
+  id: string;
   email: string;
-  company?: string;
+  segments?: string[];
 };
 
 export default function Contacts() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [email, setEmail] = useState('');
-  const [name, setName] = useState('');
+  const [segmentsInput, setSegmentsInput] = useState(''); // comma separated
+  const [loading, setLoading] = useState(true);
 
-  async function load() {
-    const res = await fetch('/api/contacts');
-    setContacts(await res.json());
-  }
-
-  async function addContact() {
-    await fetch('/api/contacts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, name }),
-    });
-    setEmail('');
-    setName('');
-    load();
-  }
-
-  async function remove(id: string) {
-    await fetch(`/api/contacts/${id}`, { method: 'DELETE' });
-    load();
+  async function loadContacts() {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/contacts'); // updated URL
+      const data = await res.json();
+      // Map _id → id for frontend
+      const formatted = data.map((c: any) => ({
+        id: c._id,
+        email: c.email,
+        segments: Array.isArray(c.segments) ? c.segments : [],
+      }));
+      setContacts(formatted);
+    } catch (err) {
+      console.error(err);
+      setContacts([]);
+    } finally {
+      setLoading(false);
+    }
   }
 
   useEffect(() => {
-    load();
+    loadContacts();
   }, []);
 
+  async function createContact() {
+    if (!email) {
+      alert('Email required');
+      return;
+    }
+
+    const segments = segmentsInput
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    try {
+      const res = await fetch('/api/contacts', { // updated URL
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, segments }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        alert('Failed: ' + (err?.error ?? res.statusText));
+        return;
+      }
+
+      setEmail('');
+      setSegmentsInput('');
+      loadContacts();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to create contact');
+    }
+  }
+
   return (
-    <div>
-      <div className='flex flex-row justify-between items-center mb-4'>
-        <h2>Contacts</h2>
-        <Link href="/contacts">See all</Link>
-      </div>
-      <div style={{ marginBottom: 12 }}>
-        <input
-          placeholder="Name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
+    <div style={{ marginTop: 24, marginBottom: 24 }}>
+      <h2>Contacts</h2>
+
+      <div style={{ marginBottom: 8 }}>
         <input
           placeholder="Email"
           value={email}
           onChange={(e) => setEmail(e.target.value)}
+          style={{ width: 300, marginRight: 8 }}
         />
-        <button onClick={addContact}>Add</button>
+        <input
+          placeholder="Segments (comma separated e.g. leads,beta)"
+          value={segmentsInput}
+          onChange={(e) => setSegmentsInput(e.target.value)}
+          style={{ width: 360, marginRight: 8 }}
+        />
+        <button onClick={createContact}>Create</button>
       </div>
 
-      {contacts.map((c) => {
-
-        return (
-          <div key={c._id} style={{ borderBottom: '1px solid #eee', padding: 6 }}>
-            {c.name} — {c.email}
-            <button onClick={() => remove(c._id)}>Delete</button>
-          </div>
-        )
-      })}
+      {loading ? (
+        <div>Loading contacts…</div>
+      ) : (
+        <div style={{ maxWidth: 760 }}>
+          {contacts.length === 0 && <div>No contacts yet.</div>}
+          {contacts.map((c) => (
+            <div key={c.id} style={{ borderBottom: '1px solid #eee', padding: 8 }}>
+              <div><strong>{c.email}</strong></div>
+              <div style={{ fontSize: 13, color: '#666' }}>
+                Segments: {(c.segments || []).join(', ')}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
