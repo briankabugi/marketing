@@ -2,7 +2,10 @@
   "/_app": "pages/_app.js",
   "/_error": "pages/_error.js",
   "/_document": "pages/_document.js",
+  "/api/contacts": "pages/api/contacts.js",
+  "/api/campaign/list": "pages/api/campaign/list.js",
+  "/api/contacts/segments": "pages/api/contacts/segments.js",
   "/": "pages/index.js",
-  "/contacts": "pages/contacts.js",
-  "/api/campaign/list": "pages/api/campaign/list.js"
+  "/api/campaign/preview": "pages/api/campaign/preview.js",
+  "/api/campaign/start": "pages/api/campaign/start.js"
 }
