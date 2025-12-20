@@ -241,12 +241,14 @@ export default function Dashboard() {
       {campaigns.map((c) => (
         <div
           key={c.id}
+          onClick={() => (window.location.href = `/campaigns/${c.id}`)}
           style={{
             border: '1px solid #ddd',
             padding: 12,
             marginBottom: 10,
             borderRadius: 6,
             maxWidth: 680,
+            cursor: 'pointer',
           }}
         >
           <strong>{c.name}</strong>

@@ -1,27 +1,29 @@
+// pages/api/campaign/start.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { Queue } from 'bullmq';
 import { redis } from '../../../lib/redis';
 import clientPromise from '../../../lib/mongo';
+import { ObjectId } from 'mongodb';
 
 const queue = new Queue('campaigns', { connection: redis });
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+// utility to chunk arrays
+function chunkArray<T>(arr: T[], size = 1000): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  /**
-   * Expected payload:
-   * {
-   *   name: string,
-   *   contacts: { type: 'all' } | { type: 'segment', value: string },
-   *   initial: { subject: string, body: string },
-   *   followUps?: Step[]
-   * }
-   */
   const { name, contacts, initial, followUps = [] } = req.body;
 
-  // ---- Validation ----
   if (!name || typeof name !== 'string') {
     return res.status(400).json({ error: 'Campaign name required' });
   }
@@ -34,7 +36,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(400).json({ error: 'Invalid contact selection' });
   }
 
-  // ---- Load contacts from MongoDB ----
   const client = await clientPromise;
   const db = client.db('PlatformData');
 
@@ -46,40 +47,89 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const contactDocs = await db
     .collection('contacts')
     .find(query)
-    .project({ email: 1 })
+    .project({ _id: 1, email: 1 })
     .toArray();
 
-  if (contactDocs.length === 0) {
+  if (!contactDocs.length) {
     return res.status(400).json({ error: 'No contacts matched selection' });
   }
 
-  // ---- Create campaign ----
-  const campaignId = Date.now().toString();
-  const createdAt = new Date().toISOString();
+  const createdAt = new Date();
 
-  await redis.hset(`campaign:${campaignId}:meta`, {
+  // --- Create campaign document ---
+  const campaignDoc = {
     name,
-    total: contactDocs.length,
-    processed: 0,
+    contacts,
+    initial,
+    followUps,
+    totals: {
+      intended: contactDocs.length,
+      processed: 0,
+      sent: 0,
+      failed: 0,
+    },
     status: 'running',
     createdAt,
-    initialSubject: initial.subject,
-    initialBody: initial.body,
-    followUps: JSON.stringify(followUps),
-  });
+  };
 
-  await redis.sadd('campaign:all', campaignId);
+  const campaignResult = await db
+    .collection('campaigns')
+    .insertOne(campaignDoc);
 
-  // ---- Enqueue jobs ----
+  const campaignObjectId = campaignResult.insertedId;
+  const campaignId = campaignObjectId.toString();
+
+  // --- Insert ledger idempotently ---
+  const ledgerDocs = contactDocs.map((c) => ({
+    campaignId: campaignObjectId,
+    contactId: c._id,
+    status: 'pending',
+    attempts: 0,
+    createdAt: new Date(),
+  }));
+
+  const chunks = chunkArray(ledgerDocs, 1000);
+  for (const chunk of chunks) {
+    try {
+      await db
+        .collection('campaign_contacts')
+        .insertMany(chunk, { ordered: false });
+    } catch (e) {
+      // Duplicate key errors are safe to ignore (idempotency)
+    }
+  }
+
+  // --- Redis runtime meta (best-effort) ---
+  try {
+    await redis.hset(`campaign:${campaignId}:meta`, {
+      name,
+      total: String(contactDocs.length),
+      processed: '0',
+      sent: '0',
+      failed: '0',
+      status: 'running',
+      createdAt: createdAt.toISOString(),
+    });
+
+    await redis.set(
+      `campaign:${campaignId}:definition`,
+      JSON.stringify({ initial, followUps, name, contacts })
+    );
+
+    await redis.sadd('campaign:all', campaignId);
+  } catch (e) {
+    console.warn('Redis unavailable during campaign start', e);
+  }
+
+  // --- Enqueue initial jobs ONLY for pending ledger rows ---
   for (const c of contactDocs) {
     if (!c.email) continue;
 
     await queue.add(
-      'send',
+      'initial',
       {
         campaignId,
-        contact: { email: c.email },
-        stepIndex: 0, // initial email
+        contactId: c._id.toString(),
       },
       {
         removeOnComplete: true,
@@ -88,16 +138,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     );
   }
 
-  // ---- Notify UI (SSE / live updates) ----
-  await redis.publish(
-    'campaign:new',
-    JSON.stringify({
-      id: campaignId,
-      name,
-      total: contactDocs.length,
-      createdAt,
-    })
-  );
+  // --- Notify UI ---
+  try {
+    await redis.publish(
+      'campaign:new',
+      JSON.stringify({
+        id: campaignId,
+        name,
+        total: contactDocs.length,
+        createdAt: createdAt.toISOString(),
+      })
+    );
+  } catch {
+    // non-fatal
+  }
 
   return res.status(201).json({
     campaignId,
