@@ -4,6 +4,12 @@
   "/_document": "pages/_document.js",
   "/": "pages/index.js",
   "/campaigns/[id]": "pages/campaigns/[id].js",
+  "/contacts": "pages/contacts.js",
+  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js",
+  "/api/campaign/[id]/control": "pages/api/campaign/[id]/control.js",
+  "/api/contacts": "pages/api/contacts.js",
   "/api/campaign/list": "pages/api/campaign/list.js",
-  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js"
+  "/api/contacts/segments": "pages/api/contacts/segments.js",
+  "/api/campaign/preview": "pages/api/campaign/preview.js",
+  "/api/campaign/start": "pages/api/campaign/start.js"
 }

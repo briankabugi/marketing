@@ -19,13 +19,8 @@ export default async function handler(
     const campaignId = new ObjectId(id);
 
     // --- MongoDB: authoritative campaign document ---
-    const campaign = await db
-      .collection('campaigns')
-      .findOne({ _id: campaignId });
-
-    if (!campaign) {
-      return res.status(404).json({ error: 'Campaign not found' });
-    }
+    const campaign = await db.collection('campaigns').findOne({ _id: campaignId });
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
     // --- Redis meta (best-effort, optional) ---
     let redisMeta: Record<string, string> | null = null;
@@ -38,47 +33,29 @@ export default async function handler(
       console.warn('Redis unavailable, falling back to Mongo', e);
     }
 
-    // --- Totals (Redis preferred, Mongo fallback) ---
-    const totals = {
-      intended: Number(
-        redisMeta?.total ?? campaign.totals?.intended ?? 0
-      ),
-      processed: Number(
-        redisMeta?.processed ?? campaign.totals?.processed ?? 0
-      ),
-      sent: Number(
-        redisMeta?.sent ?? campaign.totals?.sent ?? 0
-      ),
-      failed: Number(
-        redisMeta?.failed ?? campaign.totals?.failed ?? 0
-      ),
-    };
-
-    // --- Breakdown from MongoDB ledger ---
+    // --- Breakdown from MongoDB ledger (authoritative) ---
     const aggregation = await db
       .collection('campaign_contacts')
       .aggregate([
         { $match: { campaignId } },
-        {
-          $group: {
-            _id: '$status',
-            count: { $sum: 1 },
-          },
-        },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
       ])
       .toArray();
 
-    const breakdown = {
-      pending: 0,
-      sent: 0,
-      failed: 0,
-    };
-
+    const breakdown = { pending: 0, sent: 0, failed: 0 };
     for (const row of aggregation) {
       if (row._id === 'pending') breakdown.pending = row.count;
       else if (row._id === 'sent') breakdown.sent = row.count;
       else if (row._id === 'failed') breakdown.failed = row.count;
     }
+
+    // --- Totals derived from breakdown (ensure consistency) ---
+    const totals = {
+      intended: Number(redisMeta?.total ?? campaign.totals?.intended ?? 0),
+      processed: breakdown.sent + breakdown.failed,
+      sent: breakdown.sent,
+      failed: breakdown.failed,
+    };
 
     // --- Recent failures ---
     const recentFailures = await db
@@ -89,10 +66,7 @@ export default async function handler(
       .toArray();
 
     // --- Status resolution ---
-    const resolvedStatus =
-      campaign.completedAt
-        ? 'completed'
-        : redisMeta?.status ?? campaign.status;
+    const resolvedStatus = campaign.completedAt ? 'completed' : redisMeta?.status ?? campaign.status;
 
     res.status(200).json({
       campaign: {

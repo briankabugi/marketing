@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 
 type Contact = {
@@ -72,7 +73,7 @@ export default function Contacts() {
   return (
     <div style={{ marginTop: 24, marginBottom: 24 }}>
       <h2>Contacts</h2>
-
+      <Link href="/contacts" className='mb-4'>See all Contacts</Link>
       <div style={{ marginBottom: 8 }}>
         <input
           placeholder="Email"

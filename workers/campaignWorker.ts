@@ -1,5 +1,5 @@
 // workers/campaignWorker.ts
-import 'dotenv/config';
+import 'dotenv/config'; // critical
 import { Worker, Queue } from 'bullmq';
 import { redis } from '../lib/redis';
 import clientPromise from '../lib/mongo';
@@ -20,84 +20,51 @@ const transporter = nodemailer.createTransport({
 });
 
 function computeRetryDelay(attempts: number) {
-  const base = 60 * 1000;
+  const base = 60 * 1000; // 1 minute base
   return Math.pow(2, attempts - 1) * base;
 }
 
 new Worker(
   'campaigns',
   async (job) => {
-    const { campaignId, contactId, step } = job.data as {
-      campaignId: string;
-      contactId: string;
-      step?: any;
-    };
+    const { campaignId, contactId, step } = job.data as { campaignId: string; contactId?: string; step?: any };
+    if (!campaignId || !contactId) {
+      console.warn('Job missing campaignId or contactId', job.id);
+      return;
+    }
 
-    if (!campaignId || !contactId) return;
+    // --- PATCH: check campaign status before any processing ---
+    const campaignStatus = await redis.hget(`campaign:${campaignId}:meta`, 'status');
+    if (campaignStatus === 'paused' || campaignStatus === 'cancelled') {
+      console.log(`Skipping job ${job.id} for campaign ${campaignId} due to status ${campaignStatus}`);
+      return;
+    }
 
     const client = await clientPromise;
     const db = client.db('PlatformData');
 
-    const campaignObjectId = new ObjectId(campaignId);
-    const contactObjectId = new ObjectId(contactId);
-
-    // --- Load ledger entry (idempotency gate) ---
-    const ledger = await db.collection('campaign_contacts').findOne({
-      campaignId: campaignObjectId,
-      contactId: contactObjectId,
-    });
-
-    if (!ledger) return;
-
-    // Already sent → NOOP
-    if (ledger.status === 'sent') return;
-
-    if (ledger.attempts >= MAX_ATTEMPTS) {
-      await db.collection('campaign_contacts').updateOne(
-        { _id: ledger._id },
-        { $set: { status: 'failed', lastAttemptAt: new Date() } }
-      );
-      return;
-    }
-
-    // --- Load contact (send-time unsubscribe check) ---
-    const contact = await db.collection('contacts').findOne({
-      _id: contactObjectId,
-      unsubscribedAt: { $exists: false },
-    });
-
+    // load contact
+    const contact = await db.collection('contacts').findOne({ _id: new ObjectId(contactId) });
     if (!contact || !contact.email) {
       await db.collection('campaign_contacts').updateOne(
-        { _id: ledger._id },
-        {
-          $set: {
-            status: 'failed',
-            lastError: 'missing or unsubscribed contact',
-            lastAttemptAt: new Date(),
-          },
-          $inc: { attempts: 1 },
-        }
+        { campaignId: new ObjectId(campaignId), contactId: new ObjectId(contactId) },
+        { $set: { status: 'failed', lastError: 'missing contact or email', lastAttemptAt: new Date() }, $inc: { attempts: 1 } }
       );
+      await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
       await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
       return;
     }
 
-    // --- Load campaign definition ---
     const defRaw = await redis.get(`campaign:${campaignId}:definition`);
-    if (!defRaw) throw new Error('Missing campaign definition');
-
+    if (!defRaw) {
+      console.warn('Missing campaign definition for', campaignId);
+      throw new Error('Missing campaign definition');
+    }
     const definition = JSON.parse(defRaw);
     const isInitial = job.name === 'initial';
+    const subject = isInitial ? definition.initial.subject : (step?.subject || definition.initial.subject);
+    const body = isInitial ? definition.initial.body : (step?.body || definition.initial.body);
 
-    const subject = isInitial
-      ? definition.initial.subject
-      : step?.subject ?? definition.initial.subject;
-
-    const body = isInitial
-      ? definition.initial.body
-      : step?.body ?? definition.initial.body;
-
-    // --- Attempt send ---
     try {
       await transporter.sendMail({
         from: process.env.SMTP_FROM,
@@ -106,98 +73,74 @@ new Worker(
         html: body,
       });
     } catch (err: any) {
-      const attempts = ledger.attempts + 1;
+      const before = await db.collection('campaign_contacts').findOne({
+        campaignId: new ObjectId(campaignId),
+        contactId: new ObjectId(contactId),
+      });
+      const nextAttempts = (before?.attempts || 0) + 1;
 
       await db.collection('campaign_contacts').updateOne(
-        { _id: ledger._id },
+        { campaignId: new ObjectId(campaignId), contactId: new ObjectId(contactId) },
         {
-          $set: {
-            status: attempts >= MAX_ATTEMPTS ? 'failed' : 'pending',
-            lastError: err?.message ?? String(err),
-            lastAttemptAt: new Date(),
-          },
+          $set: { status: nextAttempts >= MAX_ATTEMPTS ? 'failed' : 'failed', lastError: (err && err.message) ? err.message : String(err), lastAttemptAt: new Date() },
           $inc: { attempts: 1 },
         }
       );
 
-      if (attempts < MAX_ATTEMPTS) {
+      await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
+      await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
+
+      if (nextAttempts < MAX_ATTEMPTS) {
         await queue.add(
           job.name,
           { campaignId, contactId, step },
-          {
-            delay: computeRetryDelay(attempts),
-            removeOnComplete: true,
-            removeOnFail: true,
-          }
+          { delay: computeRetryDelay(nextAttempts), removeOnComplete: true, removeOnFail: true }
         );
-      } else {
-        await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
-        await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
       }
-
       return;
     }
 
-    // --- Success ---
+    // success path
     await db.collection('campaign_contacts').updateOne(
-      { _id: ledger._id },
-      {
-        $set: { status: 'sent', lastAttemptAt: new Date() },
-        $inc: { attempts: 1 },
-      }
+      { campaignId: new ObjectId(campaignId), contactId: new ObjectId(contactId) },
+      { $set: { status: 'sent', lastAttemptAt: new Date() }, $inc: { attempts: 1 } }
     );
 
-    await redis.hincrby(`campaign:${campaignId}:meta`, 'sent', 1);
-    await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
+    if (isInitial) {
+      await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
+      await redis.hincrby(`campaign:${campaignId}:meta`, 'sent', 1);
 
-    // --- Schedule follow-ups ONCE ---
-    if (isInitial && ledger.followUpIndex == null) {
-      const followUps = definition.followUps || [];
-
-      for (let i = 0; i < followUps.length; i++) {
-        const f = followUps[i];
-        if (!f?.delayMinutes) continue;
-
+      for (const followUp of (definition.followUps || []) as any[]) {
+        if (!followUp || !followUp.delayMinutes) continue;
         await queue.add(
           'followup',
-          { campaignId, contactId, step: f },
-          { delay: f.delayMinutes * 60 * 1000 }
+          { campaignId, contactId, step: followUp },
+          { delay: followUp.delayMinutes * 60 * 1000, removeOnComplete: true, removeOnFail: true }
         );
       }
 
-      await db.collection('campaign_contacts').updateOne(
-        { _id: ledger._id },
-        { $set: { followUpIndex: followUps.length } }
-      );
-    }
-
-    // --- Completion check (safe) ---
-    const remaining = await db.collection('campaign_contacts').countDocuments({
-      campaignId: campaignObjectId,
-      status: 'pending',
-    });
-
-    if (remaining === 0) {
       const meta = await redis.hgetall(`campaign:${campaignId}:meta`);
+      const processed = Number(meta.processed || 0);
+      const total = Number(meta.total || 0);
 
-      await db.collection('campaigns').updateOne(
-        { _id: campaignObjectId },
-        {
-          $set: {
-            status: 'completed',
-            completedAt: new Date(),
-            'totals.processed': Number(meta.processed || 0),
-            'totals.sent': Number(meta.sent || 0),
-            'totals.failed': Number(meta.failed || 0),
-          },
-        }
-      );
+      if (total > 0 && processed >= total) {
+        await db.collection('campaigns').updateOne(
+          { _id: new ObjectId(campaignId) },
+          {
+            $set: {
+              status: 'completed',
+              completedAt: new Date(),
+              'totals.processed': processed,
+              'totals.sent': Number(meta.sent || 0),
+              'totals.failed': Number(meta.failed || 0),
+            },
+          }
+        );
 
-      await redis.hset(`campaign:${campaignId}:meta`, 'status', 'completed');
-      await redis.publish(
-        'campaign:new',
-        JSON.stringify({ campaignId, status: 'completed' })
-      );
+        await redis.hset(`campaign:${campaignId}:meta`, 'status', 'completed');
+        await redis.publish('campaign:new', JSON.stringify({ campaignId, status: 'completed' }));
+        await redis.del(`campaign:${campaignId}:definition`);
+      }
     }
   },
   { connection: redis }
