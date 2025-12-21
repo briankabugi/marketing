@@ -1,73 +1,116 @@
-import clientPromise from '../../../lib/mongo';
-import formidable from 'formidable';
+import type { NextApiRequest, NextApiResponse } from 'next';
+import formidable, { File } from 'formidable';
 import * as XLSX from 'xlsx';
+import fs from 'fs';
+import path from 'path';
 
-export const config = { api: { bodyParser: false } };
+export const config = {
+  api: { bodyParser: false },
+};
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+function normalizeHeader(key: string) {
+  return key.replace(/^\uFEFF/, '').trim().toLowerCase();
+}
 
-  const form = new formidable.IncomingForm();
-  form.parse(req, async (err, fields, files) => {
-    if (err) return res.status(500).json({ error: err.message });
+export default function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
 
-    const filePath = files.file.filepath;
-    const workbook = XLSX.readFile(filePath);
-    const sheetName = workbook.SheetNames[0];
-    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+  const form = formidable({ multiples: false, keepExtensions: true });
 
-    // Map CSV/Excel headers to your schema
-    const FIELD_MAP: Record<string, string> = {
-      name: 'name',
-      Name: 'name',
-      email: 'email',
-      Email: 'email',
-      phone: 'phone',
-      Phone: 'phone',
-      whatsapp: 'whatsapp',
-      WhatsApp: 'whatsapp',
-      location: 'location',
-      Location: 'location',
-      segments: 'segments',
-      Segments: 'segments',
-    };
-
-    const validatedContacts: any[] = [];
-    let rejectedCount = 0;
-
-    for (const row of data) {
-      const contact: any = {};
-
-      // Map fields according to FIELD_MAP
-      for (const key in row) {
-        const mappedKey = FIELD_MAP[key];
-        if (mappedKey) contact[mappedKey] = row[key];
+  form.parse(req, (err, _fields, files) => {
+    try {
+      if (err) {
+        return res.status(500).json({ error: err.message });
       }
 
-      // Ensure segments is an array
-      if (contact.segments) {
+      let file = files.file as File | File[] | undefined;
+      if (Array.isArray(file)) file = file[0];
+
+      if (!file || !file.filepath) {
+        return res.status(400).json({
+          error: 'Invalid file upload (missing filepath)',
+        });
+      }
+
+      const originalName = file.originalFilename ?? '';
+      const ext =
+        path.extname(originalName).toLowerCase() ||
+        (file.mimetype?.includes('csv')
+          ? '.csv'
+          : file.mimetype?.includes('excel')
+          ? '.xlsx'
+          : '');
+
+      if (!['.csv', '.xls', '.xlsx'].includes(ext)) {
+        return res.status(400).json({
+          error: 'Unsupported file type',
+          debug: {
+            originalFilename: file.originalFilename,
+            mimetype: file.mimetype,
+          },
+        });
+      }
+
+      const buffer = fs.readFileSync(file.filepath);
+
+      const workbook = XLSX.read(buffer, {
+        type: 'buffer',
+        raw: true,
+      });
+
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, {
+        defval: '',
+      });
+
+      const FIELD_MAP: Record<string, string> = {
+        name: 'name',
+        email: 'email',
+        phone: 'phone',
+        whatsapp: 'whatsapp',
+        location: 'location',
+        segments: 'segments',
+      };
+
+      const contacts: any[] = [];
+      let rejected = 0;
+
+      rows.forEach((row) => {
+        const contact: any = {};
+
+        for (const key in row) {
+          const normalized = normalizeHeader(key);
+          const mapped = FIELD_MAP[normalized];
+          if (mapped) {
+            contact[mapped] = String(row[key]).trim();
+          }
+        }
+
         contact.segments = contact.segments
-          .toString()
-          .split(',')
-          .map((s: string) => s.trim());
-      } else {
-        contact.segments = [];
-      }
+          ? contact.segments.split(',').map((s: string) => s.trim())
+          : [];
 
-      // Reject if missing name or email
-      if (!contact.name || !contact.email) {
-        rejectedCount++;
-        continue;
-      }
+        if (!contact.name || !contact.email) {
+          rejected++;
+          return;
+        }
 
-      validatedContacts.push(contact);
+        contacts.push(contact);
+      });
+
+      return res.status(200).json({
+        total: rows.length,
+        valid: contacts.length,
+        rejected,
+        contacts,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
     }
-
-    res.status(200).json({
-      total: data.length,
-      valid: validatedContacts.length,
-      rejected: rejectedCount,
-      contacts: validatedContacts,
-    });
   });
 }

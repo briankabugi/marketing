@@ -2,7 +2,12 @@
   "/_app": "pages/_app.js",
   "/_error": "pages/_error.js",
   "/_document": "pages/_document.js",
+  "/contacts": "pages/contacts.js",
+  "/api/contacts": "pages/api/contacts.js",
+  "/api/contacts/import": "pages/api/contacts/import.js",
+  "/api/contacts/upload": "pages/api/contacts/upload.js",
   "/": "pages/index.js",
-  "/campaigns/[id]": "pages/campaigns/[id].js",
-  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js"
+  "/api/contacts/segments": "pages/api/contacts/segments.js",
+  "/api/campaign/list": "pages/api/campaign/list.js",
+  "/api/contacts/[id]": "pages/api/contacts/[id].js"
 }

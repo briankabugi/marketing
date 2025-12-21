@@ -1,3 +1,4 @@
+// components/ImportModal.tsx
 import { useState } from 'react';
 
 export default function ImportModal({ isOpen, onClose, refresh }: { isOpen: boolean; onClose: () => void; refresh: () => void }) {
@@ -15,7 +16,7 @@ export default function ImportModal({ isOpen, onClose, refresh }: { isOpen: bool
     setStep('validating');
 
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('file', file, file.name);
 
     try {
       const res = await fetch('/api/contacts/import', { method: 'POST', body: formData });
