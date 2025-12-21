@@ -4,6 +4,8 @@
   "/_document": "pages/_document.js",
   "/": "pages/index.js",
   "/api/contacts": "pages/api/contacts.js",
+  "/api/campaign/list": "pages/api/campaign/list.js",
   "/api/contacts/segments": "pages/api/contacts/segments.js",
-  "/api/campaign/list": "pages/api/campaign/list.js"
+  "/campaigns/[id]": "pages/campaigns/[id].js",
+  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js"
 }
