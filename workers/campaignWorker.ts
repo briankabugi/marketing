@@ -9,6 +9,11 @@ import { ObjectId } from 'mongodb';
 const queue = new Queue('campaigns', { connection: redis });
 const MAX_ATTEMPTS = 3;
 
+// --- Per-account rate limiting config ---
+const RATE_LIMIT_MAX = Number(process.env.EMAIL_RATE_MAX || 20); // max emails
+const RATE_LIMIT_DURATION = Number(process.env.EMAIL_RATE_DURATION || 1000); // ms
+
+// --- Nodemailer transporter ---
 const transporter = nodemailer.createTransport({
   host: process.env.ZOHO_HOST,
   port: Number(process.env.ZOHO_PORT || 587),
@@ -19,9 +24,23 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// exponential backoff for retries
 function computeRetryDelay(attempts: number) {
   const base = 60 * 1000; // 1 minute base
   return Math.pow(2, attempts - 1) * base;
+}
+
+// simple domain throttling map
+const domainTimestamps: Record<string, number[]> = {};
+
+function canSendToDomain(domain: string) {
+  const now = Date.now();
+  domainTimestamps[domain] = domainTimestamps[domain] || [];
+  // remove timestamps older than RATE_LIMIT_DURATION
+  domainTimestamps[domain] = domainTimestamps[domain].filter(ts => now - ts < RATE_LIMIT_DURATION);
+  if (domainTimestamps[domain].length >= RATE_LIMIT_MAX) return false;
+  domainTimestamps[domain].push(now);
+  return true;
 }
 
 new Worker(
@@ -33,7 +52,7 @@ new Worker(
       return;
     }
 
-    // --- PATCH: check campaign status before any processing ---
+    // --- Check campaign status ---
     const campaignStatus = await redis.hget(`campaign:${campaignId}:meta`, 'status');
     if (campaignStatus === 'paused' || campaignStatus === 'cancelled') {
       console.log(`Skipping job ${job.id} for campaign ${campaignId} due to status ${campaignStatus}`);
@@ -43,7 +62,7 @@ new Worker(
     const client = await clientPromise;
     const db = client.db('PlatformData');
 
-    // load contact
+    // --- Load contact ---
     const contact = await db.collection('contacts').findOne({ _id: new ObjectId(contactId) });
     if (!contact || !contact.email) {
       await db.collection('campaign_contacts').updateOne(
@@ -55,11 +74,23 @@ new Worker(
       return;
     }
 
+    const domain = contact.email.split('@')[1] || '';
+    if (!canSendToDomain(domain)) {
+      console.log(`Throttling send to domain ${domain}, requeueing job ${job.id}`);
+      await queue.add(
+        job.name,
+        { campaignId, contactId, step },
+        { delay: 500, removeOnComplete: true, removeOnFail: true } // small delay, retry soon
+      );
+      return;
+    }
+
     const defRaw = await redis.get(`campaign:${campaignId}:definition`);
     if (!defRaw) {
       console.warn('Missing campaign definition for', campaignId);
       throw new Error('Missing campaign definition');
     }
+
     const definition = JSON.parse(defRaw);
     const isInitial = job.name === 'initial';
     const subject = isInitial ? definition.initial.subject : (step?.subject || definition.initial.subject);
@@ -100,7 +131,7 @@ new Worker(
       return;
     }
 
-    // success path
+    // --- Success path ---
     await db.collection('campaign_contacts').updateOne(
       { campaignId: new ObjectId(campaignId), contactId: new ObjectId(contactId) },
       { $set: { status: 'sent', lastAttemptAt: new Date() }, $inc: { attempts: 1 } }
@@ -143,7 +174,15 @@ new Worker(
       }
     }
   },
-  { connection: redis }
+  {
+    connection: redis,
+    // Optional global concurrency limiter
+    concurrency: Number(process.env.WORKER_CONCURRENCY || 5),
+    limiter: {
+      max: RATE_LIMIT_MAX,
+      duration: RATE_LIMIT_DURATION,
+    },
+  }
 );
 
-console.log('Campaign worker running');
+console.log('Campaign worker running with rate limiting and domain throttling');
