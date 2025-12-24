@@ -3,6 +3,8 @@ import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
 import { ObjectId } from 'mongodb';
 
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 3);
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
@@ -25,7 +27,7 @@ export default async function handler(
     // --- Redis meta (best-effort, optional) ---
     let redisMeta: Record<string, string> | null = null;
     try {
-      if (redis?.isOpen) {
+      if (redis?.status === 'ready' || (redis as any).isOpen) {
         const meta = await redis.hgetall(`campaign:${id}:meta`);
         redisMeta = Object.keys(meta).length > 0 ? meta : null;
       }
@@ -57,7 +59,7 @@ export default async function handler(
       failed: breakdown.failed,
     };
 
-    // --- Recent failures ---
+    // --- Recent failures (same as before) ---
     const recentFailures = await db
       .collection('campaign_contacts')
       .find({ campaignId, status: 'failed' })
@@ -85,6 +87,8 @@ export default async function handler(
         error: f.lastError ?? null,
         lastAttemptAt: f.lastAttemptAt,
       })),
+      // NEW: expose MAX_ATTEMPTS so UI can show attempts / max
+      maxAttempts: MAX_ATTEMPTS,
     });
   } catch (err) {
     console.error('Insight API error', err);
