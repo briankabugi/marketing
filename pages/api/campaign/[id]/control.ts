@@ -1,3 +1,4 @@
+// pages/api/campaign/[id]/control.ts 
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -10,6 +11,10 @@ const queue = new Queue('campaigns', { connection: redis });
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 3);
 // server-side cap for batch retries per request
 const BATCH_RETRY_LIMIT = Number(process.env.BATCH_RETRY_LIMIT || 5000);
+// when resuming, limit how many pending jobs we'll try to (re)enqueue
+const RESUME_ENQUEUE_LIMIT = Number(process.env.RESUME_ENQUEUE_LIMIT || 5000);
+// how long before a 'sending' row is considered stale and eligible for recovery (ms)
+const STALE_SENDING_MS = Number(process.env.STALE_SENDING_MS || 90_000);
 
 type Action = 'pause' | 'resume' | 'cancel' | 'delete' | 'retryFailed' | 'retryContact';
 
@@ -124,6 +129,29 @@ async function ensureCampaignDefinition(id: string, campaignDoc: any): Promise<b
   }
 }
 
+/**
+ * Get a set of contactId strings for jobs currently enqueued for this campaign.
+ * Used to avoid enqueuing duplicates when resuming.
+ */
+async function getQueuedContactIdsForCampaign(campaignId: string): Promise<Set<string>> {
+  const set = new Set<string>();
+  try {
+    const jobs = await queue.getJobs(['waiting', 'delayed', 'active', 'paused'], 0, -1);
+    for (const j of jobs) {
+      try {
+        if (j.data?.campaignId === campaignId && j.data?.contactId) {
+          set.add(String(j.data.contactId));
+        }
+      } catch {
+        // ignore malformed jobs
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to list queued jobs for campaign when checking duplicates', e);
+  }
+  return set;
+}
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
@@ -174,6 +202,7 @@ export default async function handler(
         { $set: { status: 'paused' } }
       );
       await safeHSet(redisKey, { status: 'paused' });
+      // publish campaign-level event so UI disables retry buttons and updates state
       await safePublish('campaign:new', { id, status: 'paused' });
       return res.status(200).json({ ok: true, action: 'paused' });
     }
@@ -184,12 +213,105 @@ export default async function handler(
         return res.status(200).json({ ok: true, message: 'Already running' });
       }
 
+      // set running in DB + redis
       await db.collection('campaigns').updateOne(
         { _id: campaignObjectId },
         { $set: { status: 'running' } }
       );
       await safeHSet(redisKey, { status: 'running' });
       await safePublish('campaign:new', { id, status: 'running' });
+
+      // Re-enqueue pending contacts that currently have no queued job for this campaign.
+      // This addresses cases where jobs were removed or not enqueued while the campaign was paused,
+      // ensuring pending rows actually get processed again after resume.
+      try {
+        const queuedSet = await getQueuedContactIdsForCampaign(id);
+
+        // fetch pending docs (limit to a sane cap)
+        const pendingCursor = db.collection('campaign_contacts').find(
+          { campaignId: campaignObjectId, status: 'pending' },
+          { projection: { _id: 1, contactId: 1, step: 1 } }
+        ).limit(RESUME_ENQUEUE_LIMIT);
+
+        const pending: any[] = await pendingCursor.toArray();
+
+        const enqueuePromises: Promise<any>[] = [];
+        for (const d of pending) {
+          const cid = d.contactId ? (d.contactId.toString ? d.contactId.toString() : String(d.contactId)) : (d._id.toString ? d._id.toString() : String(d._id));
+          if (queuedSet.has(cid)) continue; // already queued
+
+          try {
+            enqueuePromises.push(
+              queue.add(
+                d.step ? 'followup' : 'initial',
+                { campaignId: id, contactId: cid, step: d.step },
+                { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
+              )
+            );
+          } catch (e) {
+            console.warn('Failed to enqueue pending contact on resume', e);
+          }
+        }
+
+        // attempt to enqueue in parallel (best-effort)
+        if (enqueuePromises.length > 0) {
+          await Promise.allSettled(enqueuePromises);
+          // notify UI that contacts have been re-queued (counts unchanged, but UI may want to refresh)
+          await safePublish('campaign:new', { id, action: 'resume_requeued', requeued: enqueuePromises.length });
+        }
+      } catch (e) {
+        console.warn('Failed to re-enqueue pending contacts on resume', e);
+      }
+
+      // Recover stale 'sending' ledger rows that may have been left in 'sending' by a crashed worker or killed process.
+      // Criteria: status === 'sending' AND lastAttemptAt older than STALE_SENDING_MS AND bgAttempts < MAX_ATTEMPTS
+      // We'll set them back to 'pending', reset bgAttempts to 0 (so background cycle restarts), and enqueue jobs.
+      try {
+        const cutoff = new Date(Date.now() - STALE_SENDING_MS);
+        const staleCursor = db.collection('campaign_contacts').find(
+          { campaignId: campaignObjectId, status: 'sending', lastAttemptAt: { $lt: cutoff } },
+          { projection: { _id: 1, contactId: 1, step: 1, bgAttempts: 1 } }
+        ).limit(RESUME_ENQUEUE_LIMIT);
+
+        const staleDocs = await staleCursor.toArray();
+        if (staleDocs.length > 0) {
+          const ids = staleDocs.map(d => d._id);
+          // Reset to pending and clear lastError, reset bgAttempts so background retries start fresh
+          await db.collection('campaign_contacts').updateMany(
+            { _id: { $in: ids } },
+            { $set: { status: 'pending', lastError: null, bgAttempts: 0 } }
+          );
+
+          // Enqueue each stale doc if not already queued
+          const queuedSet2 = await getQueuedContactIdsForCampaign(id);
+          const requeuePromises: Promise<any>[] = [];
+          for (const d of staleDocs) {
+            const cid = d.contactId ? (d.contactId.toString ? d.contactId.toString() : String(d.contactId)) : (d._id.toString ? d._id.toString() : String(d._id));
+            if (queuedSet2.has(cid)) continue;
+            try {
+              requeuePromises.push(
+                queue.add(
+                  d.step ? 'followup' : 'initial',
+                  { campaignId: id, contactId: cid, step: d.step },
+                  { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
+                )
+              );
+            } catch (e) {
+              console.warn('Failed to enqueue stale sending contact on resume', e);
+            }
+            // publish contact-level update hint so UI reflects it's now pending
+            try {
+              safePublish(`campaign:${id}:contact_update`, { contactId: cid, status: 'pending', bgAttempts: 0, attempts: undefined });
+            } catch (_) {}
+          }
+
+          if (requeuePromises.length > 0) await Promise.allSettled(requeuePromises);
+          await safePublish('campaign:new', { id, action: 'resume_recovered_sending', recovered: staleDocs.length });
+        }
+      } catch (e) {
+        console.warn('Failed to recover stale sending rows on resume', e);
+      }
+
       return res.status(200).json({ ok: true, action: 'resumed' });
     }
 
@@ -322,9 +444,9 @@ export default async function handler(
 
     // ACTION: Retry all failed contacts that are below MAX_ATTEMPTS
     if (action === 'retryFailed') {
-      // Disallow retrying if campaign is cancelled/deleted
-      if (campaign.status === 'cancelled' || campaign.status === 'deleted') {
-        return res.status(400).json({ error: 'Cannot retry contacts for cancelled/deleted campaign' });
+      // Disallow retrying if campaign is cancelled/deleted/paused
+      if (campaign.status === 'cancelled' || campaign.status === 'deleted' || campaign.status === 'paused') {
+        return res.status(400).json({ error: 'Cannot retry contacts for cancelled/deleted/paused campaign' });
       }
 
       // Ensure a Redis campaign definition exists (worker requires it)
@@ -333,8 +455,18 @@ export default async function handler(
         return res.status(500).json({ error: 'Missing campaign definition in Redis and unable to construct one from campaign document. Retry cannot proceed.' });
       }
 
-      // find failed contacts with attempts < MAX_ATTEMPTS
-      const filter = { campaignId: campaignObjectId, status: 'failed', attempts: { $lt: MAX_ATTEMPTS } };
+      // find failed contacts with attempts < MAX_ATTEMPTS AND where bgAttempts >= MAX_ATTEMPTS (meaning background cycle finished)
+      // If bgAttempts is missing (undefined/null), treat it as finished (conservative). But prefer explicit >=.
+      const filter: any = {
+        campaignId: campaignObjectId,
+        status: 'failed',
+        attempts: { $lt: MAX_ATTEMPTS },
+        $or: [
+          { bgAttempts: { $exists: false } },
+          { bgAttempts: { $gte: MAX_ATTEMPTS } },
+        ],
+      };
+
       const failedDocs = await db
         .collection('campaign_contacts')
         .find(filter, { projection: { _id: 1, contactId: 1, step: 1 } })
@@ -342,7 +474,7 @@ export default async function handler(
 
       const toRetryCount = failedDocs.length;
       if (toRetryCount === 0) {
-        return res.status(200).json({ ok: true, retried: 0, message: 'No eligible failed contacts to retry' });
+        return res.status(200).json({ ok: true, retried: 0, message: 'No eligible failed contacts to retry (either none failed, reached max attempts, or background retries still in progress).' });
       }
 
       // server-side cap enforcement
@@ -355,28 +487,32 @@ export default async function handler(
         });
       }
 
-      // Atomically mark them pending (a single updateMany)
-      const updateResult = await db.collection('campaign_contacts').updateMany(filter, {
-        $set: { status: 'pending', lastError: null },
-      });
+      // Atomically mark them pending and increment core `attempts` and reset bgAttempts
+      const ids = failedDocs.map(d => d._id);
+      const updateResult = await db.collection('campaign_contacts').updateMany(
+        { _id: { $in: ids } },
+        {
+          $set: { status: 'pending', lastError: null, bgAttempts: 0 },
+          $inc: { attempts: 1 },
+        }
+      );
 
       const updated = updateResult.modifiedCount ?? 0;
 
-      // Enqueue jobs (batch)
+      // Enqueue jobs (batch), ensure each job has MQ attempts/backoff set
       const jobs: Promise<any>[] = [];
       const CHUNK = 200; // reasonable chunking
       for (let i = 0; i < failedDocs.length; i += CHUNK) {
         const chunk = failedDocs.slice(i, i + CHUNK);
         for (const doc of chunk) {
           const contactObjId = doc.contactId ? doc.contactId : doc._id;
-          // Determine job name and payload: prefer step payload when present
           try {
             if (doc.step) {
               jobs.push(
                 queue.add(
                   'followup',
                   { campaignId: id, contactId: contactObjId.toString ? contactObjId.toString() : String(contactObjId), step: doc.step },
-                  { removeOnComplete: true, removeOnFail: true }
+                  { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
                 )
               );
             } else {
@@ -384,7 +520,7 @@ export default async function handler(
                 queue.add(
                   'initial',
                   { campaignId: id, contactId: contactObjId.toString ? contactObjId.toString() : String(contactObjId) },
-                  { removeOnComplete: true, removeOnFail: true }
+                  { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
                 )
               );
             }
@@ -412,6 +548,16 @@ export default async function handler(
         console.warn('Failed to update redis counters during retryFailed', e);
       }
 
+      // Publish contact-level updates for each retried contact (best-effort)
+      try {
+        for (const doc of failedDocs) {
+          const cid = doc.contactId ? (doc.contactId.toString ? doc.contactId.toString() : String(doc.contactId)) : (doc._id.toString ? doc._id.toString() : String(doc._id));
+          await safePublish(`campaign:${id}:contact_update`, { contactId: cid, status: 'pending', bgAttempts: 0, attempts: 1 });
+        }
+      } catch (_) {
+        // ignore publish errors
+      }
+
       await safePublish('campaign:new', { id, action: 'retryFailed', retried: updated });
 
       return res.status(200).json({ ok: true, retried: updated, attemptedEnqueue: toRetryCount });
@@ -423,9 +569,9 @@ export default async function handler(
         return res.status(400).json({ error: 'Missing contactId for retryContact' });
       }
 
-      // Disallow retrying if campaign is cancelled/deleted
-      if (campaign.status === 'cancelled' || campaign.status === 'deleted') {
-        return res.status(400).json({ error: 'Cannot retry contacts for cancelled/deleted campaign' });
+      // Disallow retrying if campaign is cancelled/deleted/paused
+      if (campaign.status === 'cancelled' || campaign.status === 'deleted' || campaign.status === 'paused') {
+        return res.status(400).json({ error: 'Cannot retry contacts for cancelled/deleted/paused campaign' });
       }
 
       // Ensure a Redis campaign definition exists (worker requires it)
@@ -458,43 +604,50 @@ export default async function handler(
       }
 
       if ((doc.attempts || 0) >= MAX_ATTEMPTS) {
-        return res.status(400).json({ error: 'Contact has reached max attempts and cannot be retried' });
+        return res.status(400).json({ error: 'Contact has reached max manual attempts and cannot be retried' });
       }
 
-      // Update single doc to pending
+      // Prevent manual retry while BullMQ background retries are still running for this contact
+      // Require bgAttempts >= MAX_ATTEMPTS (or missing) before allowing manual retry
+      const bgDone = (typeof doc.bgAttempts === 'number' ? doc.bgAttempts >= MAX_ATTEMPTS : true);
+      if (!bgDone) {
+        return res.status(400).json({ error: 'Background retries are still in progress for this contact. Please wait until the background retry cycle completes.' });
+      }
+
+      // Update single doc to pending, increment core attempts, reset bgAttempts
       await db.collection('campaign_contacts').updateOne(
         { _id: doc._id },
-        { $set: { status: 'pending', lastError: null } }
+        { $set: { status: 'pending', lastError: null, bgAttempts: 0 }, $inc: { attempts: 1 } }
       );
 
-      // Enqueue appropriate job (use doc.step if present)
+      // Enqueue appropriate job (use doc.step if present) and ensure MQ attempts/backoff are set
       try {
         if (doc.step) {
           await queue.add(
             'followup',
             { campaignId: id, contactId: contactObjId.toString ? contactObjId.toString() : String(contactObjId), step: doc.step },
-            { removeOnComplete: true, removeOnFail: true }
+            { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
           );
         } else {
           await queue.add(
             'initial',
             { campaignId: id, contactId: contactObjId.toString ? contactObjId.toString() : String(contactObjId) },
-            { removeOnComplete: true, removeOnFail: true }
+            { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
           );
         }
       } catch (e) {
         console.warn('Failed to enqueue retry job for contact', e);
-        // We already set status to pending — if enqueue fails, we can roll back to failed (best-effort)
+        // Rollback: try to revert the ledger row changes (best-effort)
         try {
           await db.collection('campaign_contacts').updateOne(
             { _id: doc._id },
-            { $set: { status: 'failed', lastError: 'enqueue-failed' } }
+            { $set: { status: 'failed', lastError: 'enqueue-failed' }, $inc: { attempts: -1 }, $set: { bgAttempts: doc.bgAttempts ?? 0 } } as any
           );
         } catch (_) {}
         return res.status(500).json({ error: 'Failed to enqueue retry job' });
       }
 
-      // Update redis counters: decrease failed by 1 if possible
+      // Update redis counters: decrease failed by 1 if possible (we moved it from failed -> pending)
       try {
         const currentFailed = await safeGetMetaInt(redisKey, 'failed');
         if (currentFailed > 0) {
@@ -503,6 +656,12 @@ export default async function handler(
       } catch (e) {
         console.warn('Failed to update redis counters during retryContact', e);
       }
+
+      // Publish contact update
+      try {
+        const cidStr = contactObjId.toString ? contactObjId.toString() : String(contactObjId);
+        await safePublish(`campaign:${id}:contact_update`, { contactId: cidStr, status: 'pending', attempts: (doc.attempts || 0) + 1, bgAttempts: 0 });
+      } catch (_) {}
 
       await safePublish('campaign:new', { id, action: 'retryContact', contactId });
 

@@ -1,5 +1,5 @@
 // pages/campaigns/[id].tsx
-import react from 'react';
+import React from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
 
@@ -11,26 +11,27 @@ type ContactRow = {
   attempts: number;
   lastAttemptAt?: string | null;
   lastError?: string | null;
+  // keep space for optional bgAttempts if server eventually sends it
+  bgAttempts?: number;
 };
 
 export default function CampaignInsight() {
   const router = useRouter();
   const { id } = router.query as { id?: string };
 
-  // ... (omitted earlier state fields for brevity — recreate same as you had)
-  const [campaign, setCampaign] = react.useState<any>(null);
-  const [breakdown, setBreakdown] = react.useState<any>(null);
-  const [totals, setTotals] = react.useState<any>(null);
-  const [recentFailures, setRecentFailures] = react.useState<any[]>([]);
-  const [maxAttempts, setMaxAttempts] = react.useState<number>(3);
+  const [campaign, setCampaign] = React.useState<any>(null);
+  const [breakdown, setBreakdown] = React.useState<any>(null);
+  const [totals, setTotals] = React.useState<any>(null);
+  const [recentFailures, setRecentFailures] = React.useState<any[]>([]);
+  const [maxAttempts, setMaxAttempts] = React.useState<number>(3);
 
-  const [items, setItems] = react.useState<ContactRow[]>([]);
-  const [total, setTotal] = react.useState<number>(0);
-  const [pages, setPages] = react.useState<number>(1);
-  const [tableLoading, setTableLoading] = react.useState(false);
-  const [availableStatuses, setAvailableStatuses] = react.useState<string[]>([]);
-  const [actionInProgress, setActionInProgress] = react.useState(false);
-  const [refreshing, setRefreshing] = react.useState(false);
+  const [items, setItems] = React.useState<ContactRow[]>([]);
+  const [total, setTotal] = React.useState<number>(0);
+  const [pages, setPages] = React.useState<number>(1);
+  const [tableLoading, setTableLoading] = React.useState(false);
+  const [availableStatuses, setAvailableStatuses] = React.useState<string[]>([]);
+  const [actionInProgress, setActionInProgress] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
 
   // URL-driven params (fallbacks)
   const query = router.query || {};
@@ -53,8 +54,9 @@ export default function CampaignInsight() {
       setTotals(body.totals);
       setRecentFailures(body.recentFailures || []);
       setMaxAttempts(body.maxAttempts ?? 3);
+      if (Array.isArray(body.availableStatuses)) setAvailableStatuses(body.availableStatuses);
     } catch (e) {
-      console.error(e);
+      console.error('Insight load error', e);
     } finally {
       if (!silent) setRefreshing(false);
     }
@@ -80,15 +82,20 @@ export default function CampaignInsight() {
         throw new Error(err.error || JSON.stringify(err));
       }
       const body = await res.json();
-      setItems((body.items || []).map((it: any) => ({
+
+      // Ensure attempts/bgAttempts are sane on load — default to 1 to avoid "0 of 3" display confusion
+      const mapped = (body.items || []).map((it: any) => ({
         id: it.id,
         contactId: it.contactId ?? null,
         email: it.email ?? null,
         status: it.status ?? null,
-        attempts: it.attempts ?? 0,
+        attempts: (typeof it.attempts === 'number' ? Math.max(1, it.attempts) : 1),
         lastAttemptAt: it.lastAttemptAt ?? null,
         lastError: it.lastError ?? null,
-      })));
+        bgAttempts: (typeof it.bgAttempts === 'number' ? Math.max(1, it.bgAttempts) : 1),
+      }));
+
+      setItems(mapped);
       setTotal(body.total ?? 0);
       setPages(body.pages ?? 1);
 
@@ -103,7 +110,7 @@ export default function CampaignInsight() {
   }
 
   // initial load + insight poll (insight only)
-  react.useEffect(() => {
+  React.useEffect(() => {
     if (!id) return;
     loadInsight();
     loadContacts();
@@ -112,51 +119,88 @@ export default function CampaignInsight() {
       loadInsight(true); // silent only update counts
     }, 5000);
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // reload contacts whenever URL query changes (status/page/pageSize)
-  react.useEffect(() => {
+  React.useEffect(() => {
     if (!id) return;
     loadContacts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, router.asPath]);
 
   // ----------------------
+  // Silent table refresh debounce (to avoid request storms)
+  // ----------------------
+  const refreshTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function scheduleSilentTableRefresh(delayMs = 300) {
+    if (refreshTimerRef.current) return;
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null;
+      loadContacts({ silent: true });
+    }, delayMs);
+  }
+
+  // ----------------------
   // EventSource (SSE) hookup
   // ----------------------
-  react.useEffect(() => {
+  React.useEffect(() => {
     if (!id) return;
     const es = new EventSource(`/api/campaign/${id}/events`);
 
+    es.onopen = () => {
+      loadInsight(true);
+      loadContacts({ silent: true });
+    };
+
     es.addEventListener('contact', (ev: any) => {
       try {
-        const payload = JSON.parse(ev.data);
-        // payload: { campaignId, contactId, status, attempts, lastAttemptAt, lastError, ... }
-        const { contactId: updatedContactId } = payload;
+        let payloadRaw = ev.data;
+        let payload: any;
+        try { payload = JSON.parse(payloadRaw); } catch { payload = { raw: String(payloadRaw) }; }
+
+        const updatedContactId = payload.contactId ?? payload.contact?.contactId ?? payload.contactIdStr ?? null;
+        if (!updatedContactId) {
+          loadInsight(true);
+          return;
+        }
         const contactIdStr = String(updatedContactId);
 
-        let matched = false;
         setItems((prev) => {
+          let matched = false;
           const next = prev.map((row) => {
-            if (row.contactId && String(row.contactId) === contactIdStr) {
+            const rowContactId = row.contactId != null ? String(row.contactId) : null;
+            const rowIdStr = row.id != null ? String(row.id) : null;
+            if ((rowContactId && rowContactId === contactIdStr) || (rowIdStr && rowIdStr === contactIdStr)) {
               matched = true;
+
+              const newAttempts = typeof payload.attempts === 'number' ? Math.max(1, payload.attempts) : row.attempts ?? 1;
+              const newBgAttempts = typeof payload.bgAttempts === 'number' ? Math.max(1, payload.bgAttempts) : row.bgAttempts ?? 1;
+              const newStatus = payload.status ?? row.status;
+              const newLastAttemptAt = payload.lastAttemptAt ?? row.lastAttemptAt;
+              const newLastError = payload.lastError ?? row.lastError;
+
               return {
                 ...row,
-                status: payload.status ?? row.status,
-                attempts: typeof payload.attempts === 'number' ? payload.attempts : row.attempts,
-                lastAttemptAt: payload.lastAttemptAt ?? row.lastAttemptAt,
-                lastError: payload.lastError ?? row.lastError,
+                status: newStatus,
+                attempts: newAttempts,
+                bgAttempts: newBgAttempts,
+                lastAttemptAt: newLastAttemptAt,
+                lastError: newLastError,
               };
             }
             return row;
           });
+
+          if (!matched) {
+            scheduleSilentTableRefresh();
+          } else {
+            loadInsight(true);
+          }
+
           return next;
         });
-
-        // If not matched (not on current page), refresh counts only
-        if (!matched) {
-          loadInsight();
-        }
       } catch (e) {
         console.warn('Malformed contact SSE payload', e);
       }
@@ -164,25 +208,41 @@ export default function CampaignInsight() {
 
     es.addEventListener('campaign', (ev: any) => {
       try {
-        const payload = JSON.parse(ev.data);
-        // some payloads may be campaign-level (status changes), so refresh counts and visible page
-        loadInsight();
-        loadContacts({ silent: true });
+        const payloadRaw = ev.data;
+        let payload: any;
+        try { payload = JSON.parse(payloadRaw); } catch { payload = { raw: String(payloadRaw) }; }
+
+        const serverStatus = payload?.status ?? payload?.state ?? null;
+        if (serverStatus && serverStatus !== (campaign?.status ?? null)) {
+          loadInsight(false);
+          loadContacts();
+          return;
+        }
+
+        loadInsight(true);
+        if (payload?.refreshContacts) {
+          loadContacts({ silent: true });
+        }
       } catch (e) {
         console.warn('Malformed campaign SSE payload', e);
       }
     });
 
+    es.addEventListener('ping', () => { /* heartbeat noop */ });
+
     es.addEventListener('error', (e) => {
-      // On error, we leave it to the browser to retry; optionally we can reconnect manually
       console.warn('EventSource error', e);
     });
 
     return () => {
       try { es.close(); } catch {}
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, /* not including items to avoid re-creating EventSource */]);
+  }, [id, /* items intentionally excluded */]);
 
   // Utility: update query params shallowly and reload contacts immediately
   function updateQuery(params: Record<string, any>) {
@@ -200,7 +260,7 @@ export default function CampaignInsight() {
       });
   }
 
-  // Control and retry handlers (same as before)
+  // Control and retry handlers
   async function updateCampaign(action: 'pause' | 'resume' | 'cancel' | 'delete') {
     if (!id || actionInProgress) return;
     if (action === 'delete') { if (!confirm('Delete campaign permanently? This cannot be undone.')) return; }
@@ -226,8 +286,9 @@ export default function CampaignInsight() {
       const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'retryContact', contactId }) });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || JSON.stringify(body));
-      // wait for SSE to update this row; also proactively refresh counts
       loadInsight();
+      // We rely on SSE to update the row; also schedule a silent table refresh to pick it up if not on SSE
+      scheduleSilentTableRefresh(500);
     } catch (e:any) {
       alert('Retry failed: ' + (e?.message || String(e)));
     } finally { setActionInProgress(false); }
@@ -249,7 +310,7 @@ export default function CampaignInsight() {
     } finally { setActionInProgress(false); }
   }
 
-  // UI render (similar to prior)
+  // UI render
   const statusOptions = availableStatuses.length > 0 ? ['all', ...availableStatuses] : ['all', 'pending', 'sending', 'sent', 'failed', 'bounced', 'cancelled'];
 
   return (
@@ -329,24 +390,39 @@ export default function CampaignInsight() {
                 <th style={{ textAlign: 'left', padding: 8 }}>Status</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Attempts</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Last Attempt</th>
-                <th style={{ textAlign: 'left', padding: 8 }}>Error</th>
+                <th style={{ textAlign: 'left', padding: 8 }}>Last Known Error</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Actions</th>
               </tr>
             </thead>
             <tbody>
               {items.length === 0 ? <tr><td colSpan={6} style={{ padding: 12, textAlign: 'center' }}>No records</td></tr> :
-                items.map(it => (
-                <tr key={it.id} style={{ borderBottom: '1px solid #eee' }}>
-                  <td style={{ padding: 8 }}>{it.email ?? it.contactId ?? '—'}</td>
-                  <td style={{ padding: 8 }}>{it.status ?? '—'}</td>
-                  <td style={{ padding: 8 }}>{it.attempts} / {maxAttempts}</td>
-                  <td style={{ padding: 8 }}>{it.lastAttemptAt ? new Date(it.lastAttemptAt).toLocaleString() : '—'}</td>
-                  <td style={{ padding: 8, color: 'red' }}>{it.lastError ?? '—'}</td>
-                  <td style={{ padding: 8 }}>
-                    <button disabled={actionInProgress || it.attempts >= maxAttempts || it.status !== 'failed'} onClick={() => retryContact(it.contactId)} title={it.attempts >= maxAttempts ? 'Reached max attempts' : 'Retry this contact'}>Retry</button>
-                  </td>
-                </tr>
-              ))}
+                items.map(it => {
+                  const bgDone = (typeof it.bgAttempts === 'number') ? it.bgAttempts >= maxAttempts : true;
+                  const canManualRetry = it.status === 'failed' && (it.attempts < maxAttempts) && bgDone;
+
+                  return (
+                    <tr key={it.id} style={{ borderBottom: '1px solid #eee' }}>
+                      <td style={{ padding: 8 }}>{it.email ?? it.contactId ?? '—'}</td>
+                      <td style={{ padding: 8 }}>{it.status ?? '—'}</td>
+                      <td style={{ padding: 8 }}>
+                        {it.attempts} / {maxAttempts}
+                        {typeof it.bgAttempts === 'number' ? <div style={{ fontSize: 11, color: '#666' }}>bg: {it.bgAttempts} / {maxAttempts}</div> : null}
+                      </td>
+                      <td style={{ padding: 8 }}>{it.lastAttemptAt ? new Date(it.lastAttemptAt).toLocaleString() : '—'}</td>
+                      <td style={{ padding: 8, color: 'red' }}>{it.lastError ?? '—'}</td>
+                      <td style={{ padding: 8 }}>
+                        <button
+                          disabled={actionInProgress || !canManualRetry}
+                          onClick={() => retryContact(it.contactId)}
+                          title={!canManualRetry ? (it.attempts >= maxAttempts ? 'Reached max attempts' : 'Background retries in progress or not failed') : 'Retry this contact'}
+                        >
+                          Retry
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
+              }
             </tbody>
           </table>
         )}

@@ -1,6 +1,14 @@
 // pages/api/campaign/[id]/events.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { redis as mainRedis } from '../../../../lib/redis';
+import { redis, subscribeToChannels } from '../../../../lib/redis';
+
+/**
+ * SSE endpoint that subscribes to Redis channels and forwards events to clients.
+ * - Keeps the connection alive with periodic heartbeats.
+ * - Supports node-redis v4 subscribe signature and ioredis-style subscribe.
+ * - Forwards campaign-level events as "campaign" and contact-level as "contact".
+ * - Protects against malformed JSON and newline payload issues by serializing here.
+ */
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { id } = req.query;
@@ -9,57 +17,86 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return;
   }
 
-  // Set SSE headers
+  // SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  // Keep connection open
-  res.flushHeaders();
+  try {
+    res.flushHeaders();
+  } catch {}
 
-  // Duplicate a Redis connection for pub/sub
-  const sub = (mainRedis as any).duplicate();
-  await sub.connect();
+  // Duplicate Redis client for pub/sub
+  const sub = (redis as any).duplicate();
+  try {
+    await sub.connect();
+  } catch (err) {
+    console.error('Failed to connect redis subscriber', err);
+    res.write(`event: error\n`);
+    res.write(`data: ${JSON.stringify({ error: 'redis-connect-failed' })}\n\n`);
+    res.end();
+    return;
+  }
 
   const channels = [
     `campaign:${id}:contact_update`,
-    'campaign:new', // keep existing channel for compatibility
+    'campaign:new',
   ];
 
-  // Message handler: forward as SSE events
+  // SSE helper
+  function writeEvent(eventName: string, payload: unknown) {
+    try {
+      const data = JSON.stringify(payload);
+      res.write(`event: ${eventName}\n`);
+      res.write(`data: ${data}\n\n`);
+      try { (res as any).flush?.(); } catch {}
+    } catch (e) {
+      console.warn('Failed to write SSE event', e);
+    }
+  }
+
+  // Standardized message handler
   const messageHandler = (channel: string, message: string) => {
     try {
-      // Send event named after channel (normalized)
-      const eventName = channel === 'campaign:new' ? 'campaign' : 'contact';
-      // SSE format: event: <name>\ndata: <json>\n\n
-      res.write(`event: ${eventName}\n`);
-      // escape newlines in payload by replacing with \\n inside JSON string
-      res.write(`data: ${message}\n\n`);
+      let payload: any = null;
+      try {
+        payload = typeof message === 'string' ? JSON.parse(message) : message;
+      } catch {
+        payload = { raw: String(message) };
+      }
+
+      if (channel === 'campaign:new') {
+        writeEvent('campaign', payload);
+      } else {
+        writeEvent('contact', payload);
+      }
     } catch (e) {
-      console.warn('SSE send failed', e);
+      console.warn('messageHandler error', e);
     }
   };
 
-  // Subscribe to channels
+  // Use helper from lib/redis for robust subscription
   try {
-    await sub.subscribe(channels, (msg: string, ch: string) => {
-      // ioredis v5 subscribe signature differs; use message handler above if provided
-      // But to be compatible, call messageHandler
-      messageHandler(ch, msg);
-    });
+    await subscribeToChannels(sub, channels, messageHandler);
   } catch (e) {
-    console.error('Failed to subscribe to redis channels', e);
-    res.write(`event: error\n`);
-    res.write(`data: ${JSON.stringify({ error: 'subscribe-failed' })}\n\n`);
+    console.error('Failed to set up Redis subscriptions', e);
+    writeEvent('error', { error: 'subscribe-failed' });
   }
 
-  // Cleanup on client disconnect
-  req.on('close', async () => {
+  // Heartbeat
+  const heartbeatMs = 15000;
+  const heartbeat = setInterval(() => {
     try {
-      await sub.unsubscribe(channels);
+      writeEvent('ping', { ts: Date.now() });
     } catch {}
+  }, heartbeatMs);
+
+  // Cleanup
+  req.on('close', async () => {
+    clearInterval(heartbeat);
+    try { await sub.unsubscribe(channels); } catch {}
     try { await sub.quit(); } catch {}
-    res.end();
+    try { res.end(); } catch {}
   });
 }

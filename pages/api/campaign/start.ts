@@ -6,6 +6,7 @@ import clientPromise from '../../../lib/mongo';
 import { ObjectId } from 'mongodb';
 
 const queue = new Queue('campaigns', { connection: redis });
+const MAX_ATTEMPTS = 3;
 
 // utility to chunk arrays
 function chunkArray<T>(arr: T[], size = 1000): T[][] {
@@ -85,6 +86,7 @@ export default async function handler(
     contactId: c._id,
     status: 'pending',
     attempts: 0,
+    bgAttempts: 0,
     createdAt: new Date(),
   }));
 
@@ -121,7 +123,7 @@ export default async function handler(
     console.warn('Redis unavailable during campaign start', e);
   }
 
-  // --- Enqueue initial jobs ONLY for pending ledger rows ---
+  // --- Enqueue initial jobs (MUST include attempts + backoff for BullMQ retry system) ---
   for (const c of contactDocs) {
     if (!c.email) continue;
 
@@ -132,6 +134,11 @@ export default async function handler(
         contactId: c._id.toString(),
       },
       {
+        attempts: MAX_ATTEMPTS,
+        backoff: {
+          type: 'exponential',
+          delay: 60_000, // 1 minute base
+        },
         removeOnComplete: true,
         removeOnFail: true,
       }

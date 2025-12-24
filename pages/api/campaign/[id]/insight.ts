@@ -1,3 +1,5 @@
+// pages/api/campaign/[id]/insight.ts
+
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -65,6 +67,7 @@ export default async function handler(
       .find({ campaignId, status: 'failed' })
       .sort({ lastAttemptAt: -1 })
       .limit(10)
+      .project({ _id: 0, contactId: 1, email: 1, attempts: 1, lastError: 1, lastAttemptAt: 1, bgAttempts: 1 })
       .toArray();
 
     // --- Status resolution ---
@@ -84,6 +87,7 @@ export default async function handler(
         contactId: f.contactId?.toString?.() ?? f.contactId,
         email: f.email,
         attempts: f.attempts,
+        bgAttempts: typeof f.bgAttempts === 'number' ? f.bgAttempts : 0,
         error: f.lastError ?? null,
         lastAttemptAt: f.lastAttemptAt,
       })),

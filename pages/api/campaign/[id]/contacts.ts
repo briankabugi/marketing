@@ -89,9 +89,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           email: 1,
           status: 1,
           attempts: 1,
+          bgAttempts: 1,
           lastAttemptAt: 1,
           lastError: 1,
           step: 1,
+          contactEmail: 1,
+          emailSnapshot: 1,
+          contactIdStr: 1,
         },
       })
       .sort({ lastAttemptAt: sort, email: 1 })
@@ -162,6 +166,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         email,
         status: r.status,
         attempts: r.attempts ?? 0,
+        bgAttempts: typeof r.bgAttempts === 'number' ? r.bgAttempts : 0,
         lastAttemptAt: r.lastAttemptAt ?? null,
         lastError: r.lastError ?? null,
         previewSubject: preview.subject ?? '',
