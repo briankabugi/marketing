@@ -1,4 +1,6 @@
-import { useEffect, useState, useRef } from 'react';
+// pages/campaigns/[id].tsx
+
+import react from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
 
@@ -35,16 +37,16 @@ export default function CampaignInsight() {
   const router = useRouter();
   const { id } = router.query;
 
-  const [loading, setLoading] = useState(true);
-  const [campaign, setCampaign] = useState<Campaign | null>(null);
-  const [totals, setTotals] = useState<Totals | null>(null);
-  const [breakdown, setBreakdown] = useState<Breakdown | null>(null);
-  const [failures, setFailures] = useState<FailureSample[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = react.useState(true);
+  const [campaign, setCampaign] = react.useState<Campaign | null>(null);
+  const [totals, setTotals] = react.useState<Totals | null>(null);
+  const [breakdown, setBreakdown] = react.useState<Breakdown | null>(null);
+  const [failures, setFailures] = react.useState<FailureSample[]>([]);
+  const [error, setError] = react.useState<string | null>(null);
 
-  const [refreshing, setRefreshing] = useState(false);
-  const [actionInProgress, setActionInProgress] = useState(false);
-  const initialLoadDone = useRef(false);
+  const [refreshing, setRefreshing] = react.useState(false);
+  const [actionInProgress, setActionInProgress] = react.useState(false);
+  const initialLoadDone = react.useRef(false);
 
   async function loadInsight(options?: { silent?: boolean; manual?: boolean }) {
     if (!id) return;
@@ -86,7 +88,7 @@ export default function CampaignInsight() {
     }
   }
 
-  useEffect(() => {
+  react.useEffect(() => {
     if (!id) return;
     loadInsight();
     const interval = setInterval(() => loadInsight({ silent: true }), 5000);

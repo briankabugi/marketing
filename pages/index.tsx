@@ -1,3 +1,4 @@
+// pages/index.tsx
 import { useEffect, useState } from 'react';
 import Contacts from '../components/Contacts';
 

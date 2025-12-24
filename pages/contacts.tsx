@@ -1,3 +1,4 @@
+// pages/contacts.tsx
 'use client';
 import { useEffect, useState } from 'react';
 import ContactsTable from '../components/ContactsTable';
