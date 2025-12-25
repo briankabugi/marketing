@@ -11,8 +11,30 @@ type ContactRow = {
   attempts: number;
   lastAttemptAt?: string | null;
   lastError?: string | null;
-  // keep space for optional bgAttempts if server eventually sends it
   bgAttempts?: number;
+};
+
+type InsightPayload = {
+  campaign: {
+    id: string;
+    name: string;
+    status: string;
+    createdAt?: string;
+    completedAt?: string | null;
+  };
+  totals: {
+    intended: number;
+    processed: number;
+    sent: number;
+    failed: number;
+  };
+  breakdown: {
+    pending: number;
+    sent: number;
+    failed: number;
+  };
+  recentFailures: Array<any>;
+  maxAttempts: number;
 };
 
 export default function CampaignInsight() {
@@ -33,11 +55,44 @@ export default function CampaignInsight() {
   const [actionInProgress, setActionInProgress] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
 
-  // URL-driven params (fallbacks)
+  // engine / job UI state
+  const [sseLog, setSseLog] = React.useState<any[]>([]);
+  const sseLogRef = React.useRef<any[]>([]);
+  const [engineLoading, setEngineLoading] = React.useState(false);
+  const [lastReconcileAt, setLastReconcileAt] = React.useState<string | null>(null);
+  const [queuedEstimate, setQueuedEstimate] = React.useState<number | null>(null);
+
+  // keep refs for mounted & current fetch abort controllers to avoid race state updates
+  const mountedRef = React.useRef(true);
+  const insightAbortRef = React.useRef<AbortController | null>(null);
+  const contactsAbortRef = React.useRef<AbortController | null>(null);
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (insightAbortRef.current) insightAbortRef.current.abort();
+      if (contactsAbortRef.current) contactsAbortRef.current.abort();
+    };
+  }, []);
+
+  // URL-driven params (derived, memoized to avoid needless recalculation)
   const query = router.query || {};
-  const statusQuery = (typeof query.status === 'string' ? query.status : 'all') || 'all';
+  const statusQuery = React.useMemo(() => (typeof query.status === 'string' ? query.status : 'all') || 'all', [router.query]);
   const pageQuery = Math.max(1, Number(query.page ? query.page : 1));
   const pageSizeQuery = Math.max(1, Number(query.pageSize ? query.pageSize : 25));
+
+  // ----------------------
+  // Helpers
+  // ----------------------
+  async function safeJson(res: Response) {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
 
   // ----------------------
   // Data loading functions
@@ -45,17 +100,35 @@ export default function CampaignInsight() {
   async function loadInsight(silent = false) {
     if (!id) return;
     if (!silent) setRefreshing(true);
+
+    // abort previous insight request if any
+    if (insightAbortRef.current) {
+      try { insightAbortRef.current.abort(); } catch { }
+    }
+    insightAbortRef.current = new AbortController();
+    const signal = insightAbortRef.current.signal;
+
     try {
-      const res = await fetch(`/api/campaign/${id}/insight`);
-      if (!res.ok) throw new Error('Failed to load insight');
-      const body = await res.json();
+      const res = await fetch(`/api/campaign/${id}/insight`, { signal });
+      if (!res.ok) {
+        const body = await safeJson(res).catch(() => ({ error: 'Unknown' }));
+        throw new Error((body && (body as any).error) ? (body as any).error : `Failed to load insight (${res.status})`);
+      }
+      const body: InsightPayload = await res.json();
+      if (!mountedRef.current) return;
+
       setCampaign(body.campaign);
       setBreakdown(body.breakdown);
       setTotals(body.totals);
       setRecentFailures(body.recentFailures || []);
       setMaxAttempts(body.maxAttempts ?? 3);
-      if (Array.isArray(body.availableStatuses)) setAvailableStatuses(body.availableStatuses);
+
+      // Quick queued estimate (intended - processed)
+      const intended = Number(body.totals?.intended ?? 0);
+      const processed = Number(body.totals?.processed ?? 0);
+      setQueuedEstimate(Number.isFinite(intended - processed) ? Math.max(0, intended - processed) : null);
     } catch (e) {
+      // don't clear UI on insight error; log for debugging.
       console.error('Insight load error', e);
     } finally {
       if (!silent) setRefreshing(false);
@@ -66,6 +139,14 @@ export default function CampaignInsight() {
     if (!id) return;
     const silent = opts?.silent === true;
     if (!silent) setTableLoading(true);
+
+    // abort previous contacts request if any
+    if (contactsAbortRef.current) {
+      try { contactsAbortRef.current.abort(); } catch { }
+    }
+    contactsAbortRef.current = new AbortController();
+    const signal = contactsAbortRef.current.signal;
+
     try {
       const s = opts?.status ?? statusQuery;
       const p = opts?.page ?? pageQuery;
@@ -76,15 +157,17 @@ export default function CampaignInsight() {
       qp.set('page', String(p));
       qp.set('pageSize', String(ps));
 
-      const res = await fetch(`/api/campaign/${id}/contacts?${qp.toString()}`);
+      const res = await fetch(`/api/campaign/${id}/contacts?${qp.toString()}`, { signal });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: 'Unknown' }));
-        throw new Error(err.error || JSON.stringify(err));
+        const err = await safeJson(res).catch(() => ({ error: 'Unknown' }));
+        throw new Error((err && (err as any).error) ? (err as any).error : `Failed to load contacts (${res.status})`);
       }
       const body = await res.json();
 
-      // Ensure attempts/bgAttempts are sane on load — default to 1 to avoid "0 of 3" display confusion
-      const mapped = (body.items || []).map((it: any) => ({
+      if (!mountedRef.current) return;
+
+      // ensure attempts/bgAttempts are at least 1 for display consistency
+      const normalizedItems = (body.items || []).map((it: any) => ({
         id: it.id,
         contactId: it.contactId ?? null,
         email: it.email ?? null,
@@ -92,24 +175,25 @@ export default function CampaignInsight() {
         attempts: (typeof it.attempts === 'number' ? Math.max(1, it.attempts) : 1),
         lastAttemptAt: it.lastAttemptAt ?? null,
         lastError: it.lastError ?? null,
-        bgAttempts: (typeof it.bgAttempts === 'number' ? Math.max(1, it.bgAttempts) : 1),
-      }));
+        bgAttempts: (typeof it.bgAttempts === 'number' ? Math.max(1, it.bgAttempts) : (typeof it.bgAttempts === 'undefined' ? 0 : Number(it.bgAttempts))),
+      })) as ContactRow[];
 
-      setItems(mapped);
+      // update atomically to reduce flicker
+      setItems(normalizedItems);
       setTotal(body.total ?? 0);
       setPages(body.pages ?? 1);
 
       if (Array.isArray(body.availableStatuses)) setAvailableStatuses(body.availableStatuses);
       if (typeof body.maxAttempts === 'number') setMaxAttempts(body.maxAttempts);
     } catch (e) {
+      // Preserve prior items on error to avoid flicker; surface console message.
       console.error('Contacts load error', e);
-      if (!silent) { setItems([]); setTotal(0); setPages(1); }
     } finally {
       if (!silent) setTableLoading(false);
     }
   }
 
-  // initial load + insight poll (insight only)
+  // initial load + insight poll
   React.useEffect(() => {
     if (!id) return;
     loadInsight();
@@ -119,7 +203,6 @@ export default function CampaignInsight() {
       loadInsight(true); // silent only update counts
     }, 5000);
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // reload contacts whenever URL query changes (status/page/pageSize)
@@ -130,7 +213,7 @@ export default function CampaignInsight() {
   }, [id, router.asPath]);
 
   // ----------------------
-  // Silent table refresh debounce (to avoid request storms)
+  // Silent table refresh debounce
   // ----------------------
   const refreshTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -174,9 +257,8 @@ export default function CampaignInsight() {
             const rowIdStr = row.id != null ? String(row.id) : null;
             if ((rowContactId && rowContactId === contactIdStr) || (rowIdStr && rowIdStr === contactIdStr)) {
               matched = true;
-
               const newAttempts = typeof payload.attempts === 'number' ? Math.max(1, payload.attempts) : row.attempts ?? 1;
-              const newBgAttempts = typeof payload.bgAttempts === 'number' ? Math.max(1, payload.bgAttempts) : row.bgAttempts ?? 1;
+              const newBgAttempts = typeof payload.bgAttempts === 'number' ? Math.max(0, payload.bgAttempts) : row.bgAttempts ?? 0;
               const newStatus = payload.status ?? row.status;
               const newLastAttemptAt = payload.lastAttemptAt ?? row.lastAttemptAt;
               const newLastError = payload.lastError ?? row.lastError;
@@ -201,6 +283,15 @@ export default function CampaignInsight() {
 
           return next;
         });
+
+        // push to SSE log
+        const logEntry = {
+          ts: new Date().toISOString(),
+          type: 'contact',
+          payload,
+        };
+        sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+        setSseLog(sseLogRef.current);
       } catch (e) {
         console.warn('Malformed contact SSE payload', e);
       }
@@ -223,28 +314,38 @@ export default function CampaignInsight() {
         if (payload?.refreshContacts) {
           loadContacts({ silent: true });
         }
+
+        // sse log
+        const logEntry = {
+          ts: new Date().toISOString(),
+          type: 'campaign',
+          payload,
+        };
+        sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+        setSseLog(sseLogRef.current);
       } catch (e) {
         console.warn('Malformed campaign SSE payload', e);
       }
     });
 
-    es.addEventListener('ping', () => { /* heartbeat noop */ });
+    es.addEventListener('ping', () => { });
 
     es.addEventListener('error', (e) => {
       console.warn('EventSource error', e);
     });
 
     return () => {
-      try { es.close(); } catch {}
+      try { es.close(); } catch { }
       if (refreshTimerRef.current) {
         clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = null;
       }
     };
+    // Intentionally excluding campaign & items in deps to avoid recreating EventSource frequently
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, /* items intentionally excluded */]);
+  }, [id]);
 
-  // Utility: update query params shallowly and reload contacts immediately
+  // Utility: update query params shallowly and reload contacts immediately (silent update to avoid flicker)
   function updateQuery(params: Record<string, any>) {
     const next = { ...router.query, ...params };
     if (next.status === 'all' || next.status == null) delete next.status;
@@ -253,10 +354,12 @@ export default function CampaignInsight() {
 
     router.replace({ pathname: router.pathname, query: next }, undefined, { shallow: true })
       .then(() => {
-        loadContacts({ status: next.status ?? 'all', page: Number(next.page ?? 1), pageSize: Number(next.pageSize ?? 25) });
+        // load silently to avoid clearing the table (prevents flicker while keeping data fresh)
+        loadContacts({ status: next.status ?? 'all', page: Number(next.page ?? 1), pageSize: Number(next.pageSize ?? 25), silent: true });
       })
       .catch(() => {
-        loadContacts({ status: params.status ?? statusQuery, page: params.page ?? pageQuery, pageSize: params.pageSize ?? pageSizeQuery });
+        // fallback: attempt best-effort silent load
+        loadContacts({ status: params.status ?? statusQuery, page: params.page ?? pageQuery, pageSize: params.pageSize ?? pageSizeQuery, silent: true });
       });
   }
 
@@ -269,13 +372,13 @@ export default function CampaignInsight() {
       const payload: any = { action };
       if (action === 'delete') payload.confirm = true;
       const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || JSON.stringify(body));
+      const body = await safeJson(res);
+      if (!res.ok) throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
       if (action === 'delete') { router.push('/'); return; }
-      setCampaign((c:any) => c ? { ...c, status: (body.action === 'resumed' ? 'running' : body.action) } : c);
+      setCampaign((c: any) => c ? { ...c, status: (body.action === 'resumed' ? 'running' : body.action) } : c);
       loadInsight();
       loadContacts();
-    } catch (e:any) { alert('Action failed: ' + (e?.message || String(e))); } finally { setActionInProgress(false); }
+    } catch (e: any) { alert('Action failed: ' + (e?.message || String(e))); } finally { setActionInProgress(false); }
   }
 
   async function retryContact(contactId: string | null) {
@@ -284,12 +387,12 @@ export default function CampaignInsight() {
     setActionInProgress(true);
     try {
       const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'retryContact', contactId }) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || JSON.stringify(body));
+      const body = await safeJson(res);
+      if (!res.ok) throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
       loadInsight();
-      // We rely on SSE to update the row; also schedule a silent table refresh to pick it up if not on SSE
-      scheduleSilentTableRefresh(500);
-    } catch (e:any) {
+      // silent contacts refresh to avoid flicker
+      loadContacts({ silent: true });
+    } catch (e: any) {
       alert('Retry failed: ' + (e?.message || String(e)));
     } finally { setActionInProgress(false); }
   }
@@ -300,14 +403,82 @@ export default function CampaignInsight() {
     setActionInProgress(true);
     try {
       const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'retryFailed' }) });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || JSON.stringify(body));
-      alert(`Retry requested. Requeued ${body.retried ?? 0} contacts.`);
+      const body = await safeJson(res);
+      if (!res.ok) throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
+      alert(`Retry requested. Requeued ${((body as any).retried ?? 0)} contacts.`);
       loadInsight();
       loadContacts();
-    } catch (e:any) {
+    } catch (e: any) {
       alert('Retry failed: ' + (e?.message || String(e)));
     } finally { setActionInProgress(false); }
+  }
+
+  // Delivery engine actions
+  async function reconcileNow() {
+    if (!id || actionInProgress) return;
+    if (!confirm('Run reconciliation now? This will recompute campaign status from ledger rows and persist results.')) return;
+    setEngineLoading(true);
+    try {
+      const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'reconcile' }) });
+      const body = await safeJson(res);
+      if (!res.ok) {
+        throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
+      }
+      setLastReconcileAt(new Date().toISOString());
+      loadInsight();
+      loadContacts({ silent: true });
+      // log
+      const logEntry = { ts: new Date().toISOString(), type: 'reconcile', payload: body };
+      sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+      setSseLog(sseLogRef.current);
+    } catch (e: any) {
+      alert('Reconcile failed: ' + (e?.message || String(e)));
+    } finally {
+      setEngineLoading(false);
+    }
+  }
+
+  async function forceRequeuePending() {
+    if (!id || actionInProgress) return;
+    if (!confirm('Force requeue of pending contacts (will attempt to enqueue pending rows up to a server limit).')) return;
+    setEngineLoading(true);
+    try {
+      // resume endpoint re-enqueues pending contacts in server implementation
+      const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'resume' }) });
+      const body = await safeJson(res);
+      if (!res.ok) throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
+      loadInsight();
+      loadContacts({ silent: true });
+      const logEntry = { ts: new Date().toISOString(), type: 'force_requeue', payload: body };
+      sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+      setSseLog(sseLogRef.current);
+      alert('Requeue attempted — check job / SSE log for details.');
+    } catch (e: any) {
+      alert('Force requeue failed: ' + (e?.message || String(e)));
+    } finally {
+      setEngineLoading(false);
+    }
+  }
+
+  async function fetchQueueSnapshot() {
+    if (!id) return;
+    setEngineLoading(true);
+    try {
+      const res = await fetch(`/api/campaign/${id}/insight`);
+      if (!res.ok) throw new Error('Failed to fetch insight for queue snapshot');
+      const body: InsightPayload = await res.json();
+      const intended = Number(body.totals?.intended ?? 0);
+      const processed = Number(body.totals?.processed ?? 0);
+      setQueuedEstimate(Math.max(0, intended - processed));
+      const logEntry = { ts: new Date().toISOString(), type: 'queue_snapshot', payload: { intended, processed, queued: Math.max(0, intended - processed) } };
+      sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+      setSseLog(sseLogRef.current);
+    } catch (e) {
+      console.error('Queue snapshot failed', e);
+      alert('Queue snapshot failed: ' + ((e as any)?.message ?? String(e)));
+    } finally {
+      setEngineLoading(false);
+    }
   }
 
   // UI render
@@ -334,26 +505,26 @@ export default function CampaignInsight() {
       </div>
 
       <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6 }}>
+        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Intended</strong></div>
           <div>{totals?.intended ?? '–'}</div>
         </div>
-        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6 }}>
+        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Processed</strong></div>
           <div>{totals ? totals.processed : '–'}</div>
         </div>
-        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6 }}>
+        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Sent</strong></div>
           <div>{breakdown?.sent ?? '–'}</div>
         </div>
-        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6 }}>
+        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Failed</strong></div>
           <div>{breakdown?.failed ?? '–'}</div>
         </div>
         <div style={{ marginLeft: 'auto' }}>
           {breakdown && breakdown.failed > 0 && <button onClick={retryAllFailed} disabled={actionInProgress}>Retry all failed</button>}
         </div>
-      </div>
+      </div>  
 
       {/* Filters */}
       <div style={{ marginTop: 16, display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -377,12 +548,13 @@ export default function CampaignInsight() {
       </div>
 
       {/* Table */}
-      <div style={{ marginTop: 12, border: '1px solid #ddd', borderRadius: 6, padding: 12 }}>
+      <div style={{ marginTop: 12, border: '1px solid #ddd', borderRadius: 6, padding: 12, position: 'relative' }}>
         <div style={{ marginBottom: 8 }}>
           <strong>Total:</strong> {total} • <strong>Page:</strong> {pageQuery} / {pages}
         </div>
 
-        {tableLoading ? <div>Loading contacts…</div> : (
+        {/* Keep table present at all times to avoid layout shifts; show subtle overlay when loading */}
+        <div style={{ opacity: tableLoading ? 0.6 : 1, transition: 'opacity 120ms linear' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ borderBottom: '1px solid #ccc' }}>
@@ -411,13 +583,7 @@ export default function CampaignInsight() {
                       <td style={{ padding: 8 }}>{it.lastAttemptAt ? new Date(it.lastAttemptAt).toLocaleString() : '—'}</td>
                       <td style={{ padding: 8, color: 'red' }}>{it.lastError ?? '—'}</td>
                       <td style={{ padding: 8 }}>
-                        <button
-                          disabled={actionInProgress || !canManualRetry}
-                          onClick={() => retryContact(it.contactId)}
-                          title={!canManualRetry ? (it.attempts >= maxAttempts ? 'Reached max attempts' : 'Background retries in progress or not failed') : 'Retry this contact'}
-                        >
-                          Retry
-                        </button>
+                        <button disabled={actionInProgress || !canManualRetry} onClick={() => retryContact(it.contactId)} title={!canManualRetry ? (it.attempts >= maxAttempts ? 'Reached max attempts' : 'Background retries in progress or not failed') : 'Retry this contact'}>Retry</button>
                       </td>
                     </tr>
                   );
@@ -425,6 +591,21 @@ export default function CampaignInsight() {
               }
             </tbody>
           </table>
+        </div>
+
+        {/* overlay loader to avoid flicker when tableLoading */}
+        {tableLoading && (
+          <div style={{
+            position: 'absolute', left: 12, right: 12, top: 60, bottom: 12,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none'
+          }}>
+            <div style={{
+              background: 'rgba(255,255,255,0.9)', padding: 8, borderRadius: 6, boxShadow: '0 2px 6px rgba(0,0,0,0.08)',
+              fontSize: 13, color: '#333', pointerEvents: 'none'
+            }}>
+              Loading contacts…
+            </div>
+          </div>
         )}
 
         <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -433,6 +614,57 @@ export default function CampaignInsight() {
           <button onClick={() => updateQuery({ page: Math.min(pages, pageQuery + 1) })} disabled={pageQuery >= pages}>Next</button>
         </div>
       </div>
+      
+      {/* Delivery Engine / Job Insights */}
+      <div style={{ marginTop: 18, border: '1px solid #ddd', borderRadius: 6, padding: 12 }}>
+        <h3>Delivery Engine</h3>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ minWidth: 220 }}>
+            <div style={{ fontSize: 12, color: '#555' }}>Queued (estimate)</div>
+            <div style={{ fontSize: 18 }}>{queuedEstimate ?? '—'}</div>
+          </div>
+
+          <div style={{ minWidth: 220 }}>
+            <div style={{ fontSize: 12, color: '#555' }}>Failure rate</div>
+            <div style={{ fontSize: 18 }}>
+              {totals && totals.processed > 0 ? `${Math.round(((totals.failed || 0) / Math.max(1, totals.processed)) * 1000) / 10}%` : '—'}
+            </div>
+            <div style={{ fontSize: 11, color: '#666' }}>{`(failed ${totals?.failed ?? 0} / processed ${totals?.processed ?? 0})`}</div>
+          </div>
+
+          <div style={{ minWidth: 220 }}>
+            <div style={{ fontSize: 12, color: '#555' }}>Recent failures</div>
+            <div style={{ fontSize: 18 }}>{recentFailures?.length ?? 0}</div>
+          </div>
+
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <button onClick={reconcileNow} disabled={engineLoading || actionInProgress}>Reconcile now</button>
+            <button onClick={forceRequeuePending} disabled={engineLoading || actionInProgress}>Force requeue pending</button>
+            <button onClick={fetchQueueSnapshot} disabled={engineLoading || actionInProgress}>Queue snapshot</button>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
+          <div>Last reconcile: {lastReconcileAt ?? 'never'}</div>
+          <div>Engine loading: {engineLoading ? 'yes' : 'no'}</div>
+        </div>
+
+        {/* Job / SSE Log */}
+        <div style={{ marginTop: 12 }}>
+          <h4 style={{ marginBottom: 8 }}>Recent job / SSE log (diagnostic)</h4>
+          <div style={{ maxHeight: 240, overflow: 'auto', border: '1px solid #eee', padding: 8, borderRadius: 6, background: '#fafafa' }}>
+            {sseLog.length === 0 ? <div style={{ fontSize: 12, color: '#666' }}>No recent events</div> :
+              sseLog.map((l, idx) => (
+                <div key={idx} style={{ borderBottom: '1px solid #f0f0f0', padding: '6px 0' }}>
+                  <div style={{ fontSize: 11, color: '#333' }}><strong>{l.type}</strong> • {new Date(l.ts).toLocaleString()}</div>
+                  <pre style={{ margin: '6px 0 0', whiteSpace: 'pre-wrap', fontSize: 12 }}>{typeof l.payload === 'string' ? l.payload : JSON.stringify(l.payload, null, 2)}</pre>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+      </div>
+
     </div>
   );
 }

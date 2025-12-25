@@ -1,5 +1,3 @@
-// pages/api/campaign/[id]/contacts.ts
-
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -93,9 +91,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           lastAttemptAt: 1,
           lastError: 1,
           step: 1,
-          contactEmail: 1,
-          emailSnapshot: 1,
-          contactIdStr: 1,
         },
       })
       .sort({ lastAttemptAt: sort, email: 1 })
@@ -166,7 +161,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         email,
         status: r.status,
         attempts: r.attempts ?? 0,
-        bgAttempts: typeof r.bgAttempts === 'number' ? r.bgAttempts : 0,
+        bgAttempts: r.bgAttempts ?? 0,
         lastAttemptAt: r.lastAttemptAt ?? null,
         lastError: r.lastError ?? null,
         previewSubject: preview.subject ?? '',

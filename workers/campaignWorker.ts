@@ -7,24 +7,20 @@ import nodemailer from 'nodemailer';
 import { ObjectId } from 'mongodb';
 
 const queue = new Queue('campaigns', { connection: redis });
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 3);
 
 // --- Per-account / per-domain rate limiting config ---
-// these control baseline limits; they can be reduced dynamically
-const RATE_LIMIT_MAX = Number(process.env.EMAIL_RATE_MAX || 20); // max emails per domain window
-const RATE_LIMIT_DURATION = Number(process.env.EMAIL_RATE_DURATION || 1000 * 60); // ms window (default: 1 minute)
-const GLOBAL_RATE_LIMIT_MAX = Number(process.env.EMAIL_GLOBAL_RATE_MAX || 200); // global (all domains) default
-const GLOBAL_RATE_LIMIT_DURATION = Number(process.env.EMAIL_GLOBAL_RATE_DURATION || 1000 * 60); // ms window
+const RATE_LIMIT_MAX = Number(process.env.EMAIL_RATE_MAX || 20);
+const RATE_LIMIT_DURATION = Number(process.env.EMAIL_RATE_DURATION || 1000 * 60);
+const GLOBAL_RATE_LIMIT_MAX = Number(process.env.EMAIL_GLOBAL_RATE_MAX || 200);
+const GLOBAL_RATE_LIMIT_DURATION = Number(process.env.EMAIL_GLOBAL_RATE_DURATION || 1000 * 60);
 
-// Warm-up factor (0 < f <= 1). Use smaller values for new accounts to ramp slowly.
 const WARMUP_FACTOR = Number(process.env.EMAIL_WARMUP_FACTOR || 1.0);
 
-// Failure thresholds for dynamic throttling
-const FAILURE_RATE_WARN = Number(process.env.EMAIL_FAILURE_WARN_RATE || 0.05); // 5%
-const FAILURE_RATE_STRICT = Number(process.env.EMAIL_FAILURE_STRICT_RATE || 0.15); // 15%
+const FAILURE_RATE_WARN = Number(process.env.EMAIL_FAILURE_WARN_RATE || 0.05);
+const FAILURE_RATE_STRICT = Number(process.env.EMAIL_FAILURE_STRICT_RATE || 0.15);
 
-// throttle TTL caps (seconds)
-const DOMAIN_BLOCK_TTL_SEC = Number(process.env.EMAIL_DOMAIN_BLOCK_TTL || 60 * 5); // 5 minutes default
+const DOMAIN_BLOCK_TTL_SEC = Number(process.env.EMAIL_DOMAIN_BLOCK_TTL || 60 * 5);
 const GLOBAL_BLOCK_TTL_SEC = Number(process.env.EMAIL_GLOBAL_BLOCK_TTL || 60 * 5);
 
 // --- Nodemailer transporter ---
@@ -38,30 +34,22 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// exponential backoff for retries (used for manual delay requeues in code if needed)
+// exponential backoff utility
 function computeRetryDelay(attempts: number) {
-  const base = 60 * 1000; // 1 minute base
+  const base = 60 * 1000;
   return Math.pow(2, attempts - 1) * base;
 }
 
 function jitter(ms: number) {
-  // small random jitter up to +- 20%
   const jitterPct = Math.random() * 0.4 - 0.2;
   return Math.max(1000, Math.round(ms + ms * jitterPct));
 }
 
 function randomSmallDelay() {
-  return Math.round(Math.random() * 1000) + 250; // 250-1250ms
+  return Math.round(Math.random() * 1000) + 250;
 }
 
-// ---------------------
-// Helpers
-// ---------------------
-
-/**
- * Try to produce a ObjectId for strings that look like 24-hex; otherwise return original value.
- * This avoids throwing when non-ObjectId strings are passed as contactId.
- */
+// Try to produce an ObjectId for 24-hex strings
 function tryParseObjectId(maybeId: any) {
   if (maybeId == null) return maybeId;
   if (typeof maybeId === 'object' && maybeId instanceof ObjectId) return maybeId;
@@ -75,27 +63,9 @@ function tryParseObjectId(maybeId: any) {
   return maybeId;
 }
 
-function toObjectIdOrNew(val: string | ObjectId) {
-  if (val instanceof ObjectId) return val;
-  try {
-    return new ObjectId(String(val));
-  } catch {
-    // Last resort: return as-is (some systems use string ids)
-    return val;
-  }
-}
-
-// ---------------------
-// Redis-backed helpers
-// ---------------------
-
-/**
- * Remove old timestamps and return current count for a sorted set key.
- * Works with Redis sorted-set where members are unique strings and score==timestamp.
- */
+// Redis helpers (zset based rate limiting)
 async function getWindowCount(zkey: string, windowMs: number) {
   const now = Date.now();
-  // Remove older than window
   try {
     await (redis as any).zremrangebyscore(zkey, 0, now - windowMs);
     const count = await (redis as any).zcard(zkey);
@@ -106,38 +76,58 @@ async function getWindowCount(zkey: string, windowMs: number) {
   }
 }
 
-/**
- * Reserve a slot in a sorted set for the current send.
- * Returns true if reserved, false if couldn't reserve due to reaching capacity.
- */
 async function reserveWindowSlot(zkey: string, windowMs: number, capacity: number) {
   const now = Date.now();
-  // Clean old
   await (redis as any).zremrangebyscore(zkey, 0, now - windowMs);
   const count = Number(await (redis as any).zcard(zkey) || 0);
   if (count >= capacity) return false;
-  // Member must be unique; use timestamp + random
   const member = `${now}:${Math.floor(Math.random() * 1000000)}`;
   await (redis as any).zadd(zkey, now, member);
-  // set an expiry on the key equal to windowMs to avoid redis bloat
   await (redis as any).pexpire(zkey, Math.max(windowMs, 1000));
   return true;
 }
 
-async function incrementStats(domain: string, success: boolean) {
+/**
+ * Increment per-domain stats and optionally persist/publish a campaign-level deliverability snapshot.
+ * If campaignId is provided, writes `campaign:{campaignId}:health` fields and publishes campaign:new with `health`.
+ */
+async function incrementStats(domain: string, success: boolean, campaignId?: string) {
   const statsKey = `stats:domain:${domain}`;
   if (success) {
     await redis.hincrby(statsKey, 'sent', 1);
   } else {
     await redis.hincrby(statsKey, 'failed', 1);
   }
-  // keep stats TTL to a day for trend calculations
   await (redis as any).expire(statsKey, 60 * 60 * 24);
+
+  // If a campaignId is provided, snapshot this domain's stats onto the campaign-level health hash and publish it
+  if (campaignId) {
+    try {
+      const failed = Number(await redis.hget(statsKey, 'failed') || 0);
+      const sent = Number(await redis.hget(statsKey, 'sent') || 0);
+      const total = failed + sent;
+      const failRate = total === 0 ? 0 : (failed / total);
+      const healthKey = `campaign:${campaignId}:health`;
+      // Field names use domain-prefixed keys to be queryable; keep them compact
+      await redis.hset(healthKey, `domain:${domain}:sent`, String(sent), `domain:${domain}:failed`, String(failed), `domain:${domain}:lastUpdated`, String(Date.now()));
+      // Keep a short TTL to avoid unbounded bloat; health persists reasonably but will be refreshed by further sends
+      await (redis as any).expire(healthKey, 60 * 60 * 24 * 7); // keep for a week
+
+      // publish a lightweight health update so UI can render immediately
+      try {
+        await redis.publish('campaign:new', JSON.stringify({
+          id: campaignId,
+          health: { domain, sent, failed, failRate },
+        }));
+      } catch (e) {
+        // non-fatal
+      }
+    } catch (e) {
+      console.warn('Failed to persist/publish campaign-level health', e);
+    }
+  }
 }
 
-/**
- * Get recent failure rate (failed / (sent+failed)) for domain
- */
 async function getDomainFailureRate(domain: string) {
   const statsKey = `stats:domain:${domain}`;
   const failed = Number(await redis.hget(statsKey, 'failed') || 0);
@@ -170,46 +160,35 @@ async function isGlobalBlocked() {
   return !!val;
 }
 
-// Decide whether we can send now (checks domain, global, and dynamic reductions based on fail rate).
 async function tryAcquireSendPermit(domain: string) {
-  // If global is blocked, short-circuit
   if (await isGlobalBlocked()) return { ok: false, reason: 'global-blocked' };
-
-  // If domain is blocked, short-circuit
   if (await isDomainBlocked(domain)) return { ok: false, reason: 'domain-blocked' };
 
-  // dynamic capacity reduction based on failure rate
   const failRate = await getDomainFailureRate(domain);
   let allowed = Math.max(1, Math.floor(RATE_LIMIT_MAX * WARMUP_FACTOR));
   if (failRate >= FAILURE_RATE_STRICT) {
-    allowed = Math.max(1, Math.floor(allowed * 0.2)); // aggressive reduction
+    allowed = Math.max(1, Math.floor(allowed * 0.2));
   } else if (failRate >= FAILURE_RATE_WARN) {
-    allowed = Math.max(1, Math.floor(allowed * 0.5)); // moderate reduction
+    allowed = Math.max(1, Math.floor(allowed * 0.5));
   }
 
-  // Reserve a slot on the domain zset
   const domainKey = `rate:domain:${domain}`;
   const reserved = await reserveWindowSlot(domainKey, RATE_LIMIT_DURATION, allowed);
   if (!reserved) {
     return { ok: false, reason: 'domain-capacity' };
   }
 
-  // Reserve a slot on global zset
   try {
     const globalKey = `rate:global`;
-    // Clean old global counts
     await (redis as any).zremrangebyscore(globalKey, 0, Date.now() - GLOBAL_RATE_LIMIT_DURATION);
     const gcount = Number(await (redis as any).zcard(globalKey) || 0);
     if (gcount >= GLOBAL_RATE_LIMIT_MAX) {
-      // rollback domain reservation by removing the last member we added
-      // best-effort: remove entries older than window (already cleaned); nothing to remove specifically
       return { ok: false, reason: 'global-capacity' };
     }
     const gmember = `${Date.now()}:${Math.floor(Math.random() * 1000000)}`;
     await (redis as any).zadd(globalKey, Date.now(), gmember);
     await (redis as any).pexpire(globalKey, Math.max(GLOBAL_RATE_LIMIT_DURATION, 1000));
   } catch (e) {
-    // if global bucket can't be used, allow send (defensive)
     console.warn('Global zset ops failed, allowing send by default', e);
   }
 
@@ -228,180 +207,171 @@ async function publishContactUpdate(campaignId: string, contactId: string, paylo
 }
 
 /**
- * Robust completion/finalization helper.
- * Distinguishes between fully successful completion and completion with failures.
- * - If processed >= total and failed === 0 => mark 'completed' and cleanup definition
- * - If processed >= total and failed > 0 => mark 'completed_with_failures' and keep definition so retries can be performed
+ * Compute authoritative totals for a campaign.
+ * Try Redis meta first (fast), fallback to DB aggregation if missing/partial.
  */
-async function finalizeCampaignIfComplete(campaignIdArg: string | ObjectId, db: any) {
+async function computeCampaignTotals(db: any, campaignIdStr: string, campaignObjId: any) {
+  const redisKey = `campaign:${campaignIdStr}:meta`;
   try {
-    const campaignIdStr = typeof campaignIdArg === 'string' ? campaignIdArg : (campaignIdArg instanceof ObjectId ? campaignIdArg.toString() : String(campaignIdArg));
-    const campaignObjId = toObjectIdOrNew(campaignIdArg as any);
-
-    // Try to read redis meta (best-effort)
-    let meta: Record<string, string> = {};
-    try {
-      meta = (await redis.hgetall(`campaign:${campaignIdStr}:meta`)) || {};
-    } catch (e) {
-      meta = {};
+    const meta = await redis.hgetall(redisKey);
+    if (meta && Object.keys(meta).length > 0) {
+      const total = Number(meta.total ?? 0);
+      const processed = Number(meta.processed ?? 0);
+      const sent = Number(meta.sent ?? 0);
+      const failed = Number(meta.failed ?? 0);
+      return { total, processed, sent, failed, from: 'redis' };
     }
+  } catch (e) {
+    // ignore redis errors
+  }
 
-    let processed = Number(meta['processed'] ?? 0);
-    let total = Number(meta['total'] ?? 0);
-    let sent = Number(meta['sent'] ?? 0);
-    let failed = Number(meta['failed'] ?? 0);
+  // Fallback to DB aggregation
+  try {
+    const agg = await db.collection('campaign_contacts').aggregate([
+      { $match: { campaignId: campaignObjId } },
+      { $group: {
+        _id: '$status',
+        count: { $sum: 1 },
+      } },
+    ]).toArray();
 
-    // If redis meta looks missing or inconsistent, compute from Mongo
-    if (!total || total <= 0) {
-      try {
-        total = await db.collection('campaign_contacts').countDocuments({ campaignId: campaignObjId });
-      } catch (e) {
-        total = Number(meta['total'] ?? 0);
-      }
+    let sent = 0, failed = 0, pending = 0;
+    for (const r of agg) {
+      if (r._id === 'sent') sent = r.count;
+      else if (r._id === 'failed') failed = r.count;
+      else if (r._id === 'pending') pending = r.count;
     }
+    const camp = await db.collection('campaigns').findOne({ _id: campaignObjId });
+    const total = Number(camp?.totals?.intended ?? (sent + failed + pending));
+    const processed = sent + failed;
+    return { total, processed, sent, failed, from: 'db' };
+  } catch (e) {
+    console.warn('computeCampaignTotals fallback failed', e);
+    return { total: 0, processed: 0, sent: 0, failed: 0, from: 'error' };
+  }
+}
 
-    try {
-      const processedFromDb = await db.collection('campaign_contacts').countDocuments({ campaignId: campaignObjId, status: { $in: ['sent', 'failed'] } });
-      if (processedFromDb > processed) processed = processedFromDb;
-    } catch (e) {
-      // ignore
-    }
+/**
+ * Finalize campaign status based on totals.
+ * If processed >= total:
+ *   - if failed > 0 => 'completed_with_failures'
+ *   - else => 'completed'
+ * Update DB totals, redis meta, publish event.
+ */
+async function finalizeCampaign(campaignIdStr: string) {
+  const client = await clientPromise;
+  const db = client.db('PlatformData');
+  const campaignObjId = new ObjectId(campaignIdStr);
 
-    // If still no total or processed doesn't meet threshold, nothing to do
+  try {
+    const campaign = await db.collection('campaigns').findOne({ _id: campaignObjId });
+    if (!campaign) return;
+
+    const totals = await computeCampaignTotals(db, campaignIdStr, campaignObjId);
+    const { total, processed, sent, failed } = totals;
+
     if (total > 0 && processed >= total) {
-      // Compute sent/failed from DB if redis lacks them
-      try {
-        const agg = await db.collection('campaign_contacts').aggregate([
-          { $match: { campaignId: campaignObjId } },
-          { $group: { _id: '$status', count: { $sum: 1 } } },
-        ]).toArray();
-        sent = 0;
-        failed = 0;
-        for (const row of agg) {
-          if (row._id === 'sent') sent = row.count;
-          else if (row._id === 'failed') failed = row.count;
+      const nextStatus = failed > 0 ? 'completed_with_failures' : 'completed';
+      const now = new Date();
+
+      await db.collection('campaigns').updateOne(
+        { _id: campaignObjId },
+        {
+          $set: {
+            status: nextStatus,
+            completedAt: now,
+            'totals.processed': processed,
+            'totals.sent': sent,
+            'totals.failed': failed,
+          },
         }
+      );
+
+      try {
+        await redis.hset(`campaign:${campaignIdStr}:meta`, {
+          status: nextStatus,
+          processed: String(processed),
+          sent: String(sent),
+          failed: String(failed),
+          total: String(total),
+        });
       } catch (e) {
         // ignore
       }
 
-      // Idempotent update: if already completed, ensure redis meta is consistent
+      await redis.publish('campaign:new', JSON.stringify({ id: campaignIdStr, status: nextStatus, totals: { processed, sent, failed, total } }));
+    } else {
       try {
-        const existing = await db.collection('campaigns').findOne({ _id: campaignObjId }, { projection: { status: 1 } });
-        // If already marked completed/with failures, sync redis and return
-        if (existing && (existing.status === 'completed' || existing.status === 'completed_with_failures')) {
-          const statusToSet = existing.status === 'completed' ? 'completed' : 'completed_with_failures';
-          try {
-            await redis.hset(`campaign:${campaignIdStr}:meta`, {
-              status: statusToSet,
-              processed: String(processed),
-              sent: String(sent),
-              failed: String(failed),
-            });
-          } catch (_) {}
-          return;
-        }
-      } catch (e) {
-        // continue
-      }
-
-      const now = new Date();
-
-      if (failed === 0) {
-        // All succeeded => mark completed and cleanup definition
-        try {
-          await db.collection('campaigns').updateOne(
-            { _id: campaignObjId },
-            {
-              $set: {
-                status: 'completed',
-                completedAt: now,
-                'totals.processed': processed,
-                'totals.sent': sent,
-                'totals.failed': failed,
-              },
-            }
-          );
-        } catch (e) {
-          console.warn('Failed to persist campaign completion to Mongo', e);
-        }
-
-        try {
-          await redis.hset(`campaign:${campaignIdStr}:meta`, {
-            status: 'completed',
-            processed: String(processed),
-            sent: String(sent),
-            failed: String(failed),
-          });
-        } catch (_) {}
-
-        try {
-          await redis.publish('campaign:new', JSON.stringify({ campaignId: campaignIdStr, status: 'completed' }));
-        } catch (_) {}
-
-        try { await redis.del(`campaign:${campaignIdStr}:definition`); } catch (_) {}
-        console.log(`Campaign ${campaignIdStr} marked completed (processed=${processed} total=${total})`);
-      } else {
-        // Some failed => mark 'completed_with_failures' and keep definition so user can retry failed contacts.
-        try {
-          await db.collection('campaigns').updateOne(
-            { _id: campaignObjId },
-            {
-              $set: {
-                status: 'completed_with_failures',
-                completedAt: now,
-                'totals.processed': processed,
-                'totals.sent': sent,
-                'totals.failed': failed,
-              },
-            }
-          );
-        } catch (e) {
-          console.warn('Failed to persist campaign partial completion to Mongo', e);
-        }
-
-        try {
-          await redis.hset(`campaign:${campaignIdStr}:meta`, {
-            status: 'completed_with_failures',
-            processed: String(processed),
-            sent: String(sent),
-            failed: String(failed),
-          });
-        } catch (_) {}
-
-        try {
-          await redis.publish('campaign:new', JSON.stringify({ campaignId: campaignIdStr, status: 'completed_with_failures', failed }));
-        } catch (_) {}
-
-        // NOTE: do NOT delete campaign:{id}:definition here so that retry flows can re-use it.
-        console.log(`Campaign ${campaignIdStr} finished with failures (processed=${processed} total=${total} failed=${failed})`);
-      }
+        await redis.hset(`campaign:${campaignIdStr}:meta`, {
+          processed: String(processed),
+          sent: String(sent),
+          failed: String(failed),
+          total: String(total),
+        });
+      } catch (e) {}
     }
   } catch (e) {
-    console.warn('finalizeCampaignIfComplete error', e);
+    console.warn('finalizeCampaign error', e);
   }
 }
+
+// Small reconciler to transition 'completed_with_failures' -> 'completed' when fails are cleared,
+// and to re-run finalization for campaigns that appear finished in counters but have incorrect status.
+let reconcilerHandle: NodeJS.Timeout | null = null;
+async function startReconciler() {
+  try {
+    const client = await clientPromise;
+    const db = client.db('PlatformData');
+
+    const runOnce = async () => {
+      try {
+        const cursor = db.collection('campaigns').find(
+          { status: { $in: ['completed_with_failures', 'completed'] } },
+          { projection: { _id: 1 } }
+        ).limit(200);
+
+        const toCheck = await cursor.toArray();
+        for (const c of toCheck) {
+          try {
+            await finalizeCampaign(c._id.toString());
+          } catch (e) {
+            console.warn('Reconciler finalizeCampaign failed for', c._id?.toString(), e);
+          }
+        }
+      } catch (e) {
+        console.warn('Reconciler run failed', e);
+      }
+    };
+
+    await runOnce();
+    reconcilerHandle = setInterval(() => {
+      runOnce().catch((e) => console.warn('Reconciler interval error', e));
+    }, Number(process.env.RECONCILER_INTERVAL_MS || 60_000));
+  } catch (e) {
+    console.warn('Failed to start reconciler', e);
+  }
+}
+
+// Start reconciler (best-effort)
+startReconciler().catch((e) => console.warn('startReconciler error', e));
 
 // ---------------------
 // Worker logic
 // ---------------------
 
-// create worker and keep reference to attach listeners if needed later
 const worker = new Worker(
   'campaigns',
   async (job: Job) => {
-    // Job payload
     const { campaignId, contactId, step } = job.data as { campaignId: string; contactId?: string; step?: any };
     if (!campaignId || !contactId) {
       console.warn('Job missing campaignId or contactId', job.id);
       return;
     }
 
-    // compute current bg attempt number (BullMQ attemptsMade is number of previous attempts)
     const jobAttemptsMade = typeof (job.attemptsMade) === 'number' ? job.attemptsMade : 0;
-    const bgAttemptNumber = jobAttemptsMade + 1; // e.g., first run => 1
+    const bgAttemptNumber = jobAttemptsMade + 1;
 
-    // --- Check campaign status ---
+    // --- Check campaign status quickly via redis if possible ---
     try {
       const campaignStatus = await redis.hget(`campaign:${campaignId}:meta`, 'status');
       if (campaignStatus === 'paused' || campaignStatus === 'cancelled') {
@@ -409,24 +379,20 @@ const worker = new Worker(
         return;
       }
     } catch (e) {
-      // if redis read fails, proceed and rely on DB state below
+      // ignore redis errors and continue
     }
 
     const client = await clientPromise;
     const db = client.db('PlatformData');
 
-    // --- Normalize IDs for DB queries (robust to string/ObjectId differences) ---
     const campaignObjId = tryParseObjectId(campaignId);
     const contactObjId = tryParseObjectId(contactId);
 
-    // --- Load contact --- (ledger row)
     const ledgerFilter = { campaignId: campaignObjId, contactId: contactObjId };
     const contact = await db.collection('contacts').findOne({ _id: contactObjId });
     const ledgerRow = await db.collection('campaign_contacts').findOne(ledgerFilter);
 
-    // If ledger row is missing, be defensive and initialize or mark failed
     if (!ledgerRow) {
-      // create a ledger row (best-effort) and mark failed/processed
       try {
         await db.collection('campaign_contacts').insertOne({
           campaignId: campaignObjId,
@@ -437,19 +403,14 @@ const worker = new Worker(
           lastAttemptAt: new Date(),
           lastError: 'missing ledger row',
         });
-      } catch (e) {
-        // ignore insert errors
-      }
-      try {
-        await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
-        await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
-      } catch (_) {}
+      } catch (e) {}
+      try { await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1); await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1); } catch (_) {}
       await publishContactUpdate(campaignId, contactId, { status: 'failed', attempts: 0, bgAttempts: 0, lastAttemptAt: new Date().toISOString(), lastError: 'missing ledger row' });
+      await finalizeCampaign(campaignId);
       return;
     }
 
     if (!contact || !contact.email) {
-      // Missing contact or email: final failure, update ledger and counters
       try {
         await db.collection('campaign_contacts').updateOne(
           ledgerFilter,
@@ -460,27 +421,16 @@ const worker = new Worker(
       } catch (e) {
         console.warn('Failed to mark missing contact/email in ledger', e);
       }
-      try {
-        await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
-        await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
-      } catch (_) {}
+      try { await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1); await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1); } catch (_) {}
       await publishContactUpdate(campaignId, contactId, { status: 'failed', attempts: ledgerRow.attempts ?? 0, bgAttempts: bgAttemptNumber, lastAttemptAt: new Date().toISOString(), lastError: 'missing contact or email' });
-
-      // If this final failure caused completion, try to finalize campaign
-      try {
-        await finalizeCampaignIfComplete(campaignId, db);
-      } catch (_) {}
-
+      await finalizeCampaign(campaignId);
       return;
     }
 
     const domain = (contact.email.split('@')[1] || '').toLowerCase();
 
-    // If this is the very first attempt (bgAttemptNumber === 1) AND ledgerRow.attempts is falsy (0 or undefined),
-    // treat this as the initial "core attempt" and increment the core attempts counter so initial sends count toward the user's 3 manual/initial attempts.
-    // If ledgerRow.attempts > 0, it's either been manually retried already (control API should have incremented attempts) or previously counted — do not increment here.
+    // mark initial core attempts if needed
     if (bgAttemptNumber === 1 && !(ledgerRow.attempts && ledgerRow.attempts > 0)) {
-      // Set attempts to 1 (initial core attempt)
       try {
         await db.collection('campaign_contacts').updateOne(ledgerFilter, { $set: { attempts: 1 } });
       } catch (e) {
@@ -488,53 +438,40 @@ const worker = new Worker(
       }
     }
 
-    // diagnostic: if bgAttemptNumber keeps resetting to 1 but ledgerRow.bgAttempts already shows >0, log it
     if (bgAttemptNumber === 1 && ledgerRow.bgAttempts && ledgerRow.bgAttempts > 0) {
       console.warn(`Job ${job.id} bgAttemptNumber reset to 1 while ledgerRow.bgAttempts=${ledgerRow.bgAttempts}. This usually means job was re-enqueued as a NEW job instead of retried by BullMQ.`);
     }
 
-    // --- Try to acquire permit to send now ---
+    // Try to acquire send permit (throttling)
     const permit = await tryAcquireSendPermit(domain);
     if (!permit.ok) {
-      // ----------------------
-      // We must NOT requeue a fresh job here (that resets attemptsMade).
-      // Instead, record a throttling hint and throw so BullMQ will retry the same job (attempts/backoff).
-      // ----------------------
-
       const requeueDelay = jitter((permit.reason === 'global-blocked' || permit.reason === 'global-capacity') ? GLOBAL_BLOCK_TTL_SEC * 1000 : 500 + Math.random() * 2000);
       console.log(`Throttling send to domain ${domain} (reason=${permit.reason}), asking BullMQ to retry job ${job.id} via backoff`);
 
       try {
-        // update ledger with a throttling hint so UI can reflect a reason (do not mark processed)
         await db.collection('campaign_contacts').updateOne(
           ledgerFilter,
           {
             $set: {
-              // keep status as 'pending' to indicate it hasn't been sent; keep bgAttempts untouched so bgAttempt increments when a real attempt runs
               lastError: `throttled:${permit.reason}`,
               lastAttemptAt: new Date(),
             },
           }
         );
 
-        // Publish contact-level update so UI knows the contact is being delayed/throttled
         await publishContactUpdate(campaignId, contactId, {
           status: ledgerRow.status ?? 'pending',
           attempts: ledgerRow.attempts ?? 0,
           bgAttempts: ledgerRow.bgAttempts ?? 0,
           lastAttemptAt: new Date().toISOString(),
           lastError: `throttled:${permit.reason}`,
-          // include a hint how long we estimate to delay (best-effort) — UI may show this if desired
           throttleDelayMs: requeueDelay,
         });
       } catch (e) {
         console.warn('Failed to persist throttle hint or publish contact update', e);
       }
 
-      // Throw an error so BullMQ will perform retry/backoff according to the job options.
-      // IMPORTANT: For this to work you MUST enqueue jobs with attempts/backoff (see the start and control APIs).
       const retryError: any = new Error(`throttled:${permit.reason}`);
-      // Attach a marker so telemetry can detect throttles more easily if needed
       retryError.isThrottle = true;
       throw retryError;
     }
@@ -550,13 +487,12 @@ const worker = new Worker(
     const subject = isInitial ? definition.initial?.subject : (step?.subject || definition.initial?.subject);
     const body = isInitial ? definition.initial?.body : (step?.body || definition.initial?.body);
 
-    // Before attempting to send, write bgAttempts (attempt number) and mark as sending so UI gets immediate feedback.
+    // mark sending & bgAttempts
     try {
       await db.collection('campaign_contacts').updateOne(
         ledgerFilter,
         {
           $set: {
-            // Do not overwrite core attempts here — only touch bgAttempts
             bgAttempts: bgAttemptNumber,
             status: 'sending',
             lastAttemptAt: new Date(),
@@ -564,7 +500,7 @@ const worker = new Worker(
           },
         }
       );
-      // Publish contact-level update so UI marks the row as 'sending' and shows bgAttempts increment
+
       await publishContactUpdate(campaignId, contactId, {
         status: 'sending',
         attempts: ledgerRow.attempts ?? 0,
@@ -573,13 +509,11 @@ const worker = new Worker(
         lastError: null,
       });
     } catch (e) {
-      // proceed even if publishing fails
       console.warn('Failed to mark sending/publish update', e);
     }
 
     // Attempt to send
     try {
-      // small jitter to avoid thundering herd within the same millisecond
       await new Promise((r) => setTimeout(r, randomSmallDelay()));
 
       await transporter.sendMail({
@@ -589,7 +523,6 @@ const worker = new Worker(
         html: body,
       });
 
-      // success: update DB & stats (finalize this job)
       try {
         await db.collection('campaign_contacts').updateOne(
           ledgerFilter,
@@ -601,17 +534,13 @@ const worker = new Worker(
         console.warn('Failed to update ledger on success', e);
       }
 
-      await incrementStats(domain, true);
+      await incrementStats(domain, true, campaignId);
 
-      // Mark processed & sent (these are final counts — each contact counts once when it completes)
       try {
         await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
         await redis.hincrby(`campaign:${campaignId}:meta`, 'sent', 1);
-      } catch (e) {
-        // Non-fatal
-      }
+      } catch (e) {}
 
-      // Publish contact update
       await publishContactUpdate(campaignId, contactId, {
         status: 'sent',
         attempts: (ledgerRow.attempts ?? 0),
@@ -620,7 +549,7 @@ const worker = new Worker(
         lastError: null,
       });
 
-      // If initial, schedule follow-ups as before (ensure queued jobs carry MAX_ATTEMPTS/backoff so they each have their own MQ cycle)
+      // schedule follow-ups if initial
       if (isInitial) {
         for (const followUp of (definition.followUps || []) as any[]) {
           if (!followUp || !followUp.delayMinutes) continue;
@@ -634,27 +563,20 @@ const worker = new Worker(
             console.warn('Failed to enqueue followup', e);
           }
         }
-
-        // check totals & possibly complete campaign (robustly)
-        try {
-          await finalizeCampaignIfComplete(campaignId, db);
-        } catch (e) {
-          console.warn('Post-send completion check failed', e);
-        }
       }
+
+      // After a success, try to finalize if this completes the campaign
+      await finalizeCampaign(campaignId);
 
       return;
     } catch (err: any) {
-      // --- Failure handling with dynamic throttling decisions ---
       const smtpCode = err && (err.responseCode || err.code || err.statusCode);
       const message = (err && (err.response || err.message || String(err))) || 'unknown error';
 
-      // Record failure stats (domain-level)
       try {
-        await incrementStats(domain, false);
+        await incrementStats(domain, false, campaignId);
       } catch (_) {}
 
-      // Throttling detection
       const lowerMsg = String(message).toLowerCase();
       const throttlingIndicators = ['rate limit', 'throttl', 'too many', 'blocked', 'limit exceeded', 'try again later'];
       const isThrottleSignal =
@@ -662,26 +584,18 @@ const worker = new Worker(
         throttlingIndicators.some((s) => lowerMsg.includes(s));
 
       if (isThrottleSignal) {
-        // escalate blocking time proportional to attempts or recent fail rate
         const beforeRow = ledgerRow;
         const nextAttemptsEstimate = (beforeRow?.bgAttempts || 0) + 1;
         const failRate = await getDomainFailureRate(domain);
         const ttl = Math.min(60 * 60, Math.max(30, Math.round(DOMAIN_BLOCK_TTL_SEC * (1 + nextAttemptsEstimate * 0.5 + failRate * 4))));
-        try {
-          await setDomainBlock(domain, ttl, `smtp:${smtpCode} msg:${message}`);
-        } catch (e) {}
-
+        try { await setDomainBlock(domain, ttl, `smtp:${smtpCode} msg:${message}`); } catch (e) {}
         if (lowerMsg.includes('rate limit') || Number(smtpCode) === 421) {
-          try {
-            await setGlobalBlock(Math.min(60 * 60, GLOBAL_BLOCK_TTL_SEC), `smtp:${smtpCode}`);
-          } catch (e) {}
+          try { await setGlobalBlock(Math.min(60 * 60, GLOBAL_BLOCK_TTL_SEC), `smtp:${smtpCode}`); } catch (e) {}
         }
       }
 
-      // Determine if this attempt was the final BullMQ attempt
-      const currentAttempt = bgAttemptNumber; // job.attemptsMade + 1
+      const currentAttempt = bgAttemptNumber;
 
-      // Update ledger row with bgAttempt and lastError; DO NOT increment processed or mark final failed until we've exhausted MQ attempts
       const updateFields: any = {
         lastError: (err && err.message) ? err.message : String(err),
         lastAttemptAt: new Date(),
@@ -689,7 +603,6 @@ const worker = new Worker(
       };
 
       if (currentAttempt < MAX_ATTEMPTS) {
-        // Intermediate failure: keep core attempt untouched, keep status as 'sending' or 'pending' so UI cannot manual-retry yet
         updateFields.status = 'sending';
         try {
           await db.collection('campaign_contacts').updateOne(ledgerFilter, { $set: updateFields });
@@ -697,7 +610,6 @@ const worker = new Worker(
           console.warn('Failed to persist intermediate failure state', e);
         }
 
-        // Publish contact update so UI shows increased bgAttempts and error
         await publishContactUpdate(campaignId, contactId, {
           status: updateFields.status,
           attempts: ledgerRow.attempts ?? 0,
@@ -706,11 +618,8 @@ const worker = new Worker(
           lastError: updateFields.lastError,
         });
 
-        // Ask BullMQ to retry by throwing the error — rely on BullMQ attempts/backoff configured on the job
-        // Throwing preserves attemptsMade increment on retry; do not re-add a fresh job.
         throw err;
       } else {
-        // Final background attempt exhausted: mark as failed, increment processed & failed counters (this is final)
         updateFields.status = 'failed';
         try {
           await db.collection('campaign_contacts').updateOne(ledgerFilter, { $set: updateFields });
@@ -723,7 +632,6 @@ const worker = new Worker(
           await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
         } catch (_) {}
 
-        // publish final failed contact event
         await publishContactUpdate(campaignId, contactId, {
           status: 'failed',
           attempts: ledgerRow.attempts ?? 0,
@@ -732,12 +640,9 @@ const worker = new Worker(
           lastError: updateFields.lastError,
         });
 
-        // After final failure, attempt to finalize campaign as well
-        try {
-          await finalizeCampaignIfComplete(campaignId, db);
-        } catch (_) {}
+        // Try to finalize (this failure might make processed==total)
+        await finalizeCampaign(campaignId);
 
-        // Throw the error so BullMQ marks job failed (keeps consistent queue state)
         throw err;
       }
     }
@@ -752,19 +657,13 @@ const worker = new Worker(
   }
 );
 
-// Logging to show the worker is running
 console.log('Campaign worker running with Redis-backed dynamic throttling and domain rate control');
 
-// attach optional process-level handlers if you want to log job events (kept non-intrusive)
 worker.on('completed', async (job) => {
-  // We already handled success inside the job processor (DB updates & publishes).
-  // This listener is left intentionally light to avoid duplicating logic.
-  // Could be used for additional telemetry if desired.
+  // light listener
 });
 
 worker.on('failed', async (job, err) => {
-  // We already handle failed-case DB updates inside job processor (we throw on failure).
-  // This listener is available for logging or external telemetry.
   try {
     console.warn(`Job ${job.id} failed after ${job.attemptsMade} attempts:`, err?.message ?? err);
   } catch (e) {

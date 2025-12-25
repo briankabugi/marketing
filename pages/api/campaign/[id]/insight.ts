@@ -1,5 +1,4 @@
 // pages/api/campaign/[id]/insight.ts
-
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -37,7 +36,7 @@ export default async function handler(
       console.warn('Redis unavailable, falling back to Mongo', e);
     }
 
-    // --- Breakdown from MongoDB ledger (authoritative) ---
+    // --- Breakdown from MongoDB ledger (authoritative for rows) ---
     const aggregation = await db
       .collection('campaign_contacts')
       .aggregate([
@@ -67,11 +66,10 @@ export default async function handler(
       .find({ campaignId, status: 'failed' })
       .sort({ lastAttemptAt: -1 })
       .limit(10)
-      .project({ _id: 0, contactId: 1, email: 1, attempts: 1, lastError: 1, lastAttemptAt: 1, bgAttempts: 1 })
       .toArray();
 
-    // --- Status resolution ---
-    const resolvedStatus = campaign.completedAt ? 'completed' : redisMeta?.status ?? campaign.status;
+    // --- Status resolution: use campaign.status as source of truth ---
+    const resolvedStatus = campaign.status;
 
     res.status(200).json({
       campaign: {
@@ -87,11 +85,10 @@ export default async function handler(
         contactId: f.contactId?.toString?.() ?? f.contactId,
         email: f.email,
         attempts: f.attempts,
-        bgAttempts: typeof f.bgAttempts === 'number' ? f.bgAttempts : 0,
         error: f.lastError ?? null,
         lastAttemptAt: f.lastAttemptAt,
       })),
-      // NEW: expose MAX_ATTEMPTS so UI can show attempts / max
+      // expose MAX_ATTEMPTS so UI can show attempts / max
       maxAttempts: MAX_ATTEMPTS,
     });
   } catch (err) {

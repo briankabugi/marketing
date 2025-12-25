@@ -1,4 +1,3 @@
-// pages/api/campaign/[id]/control.ts 
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -16,7 +15,7 @@ const RESUME_ENQUEUE_LIMIT = Number(process.env.RESUME_ENQUEUE_LIMIT || 5000);
 // how long before a 'sending' row is considered stale and eligible for recovery (ms)
 const STALE_SENDING_MS = Number(process.env.STALE_SENDING_MS || 90_000);
 
-type Action = 'pause' | 'resume' | 'cancel' | 'delete' | 'retryFailed' | 'retryContact';
+type Action = 'pause' | 'resume' | 'cancel' | 'delete' | 'retryFailed' | 'retryContact' | 'reconcile';
 
 async function safeHSet(key: string, obj: Record<string, string>) {
   try {
@@ -171,7 +170,7 @@ export default async function handler(
     contactId?: string;
   };
 
-  if (!action || !['pause', 'resume', 'cancel', 'delete', 'retryFailed', 'retryContact'].includes(action)) {
+  if (!action || !['pause', 'resume', 'cancel', 'delete', 'retryFailed', 'retryContact', 'reconcile'].includes(action)) {
     return res.status(400).json({ error: 'Invalid action' });
   }
 
@@ -313,6 +312,101 @@ export default async function handler(
       }
 
       return res.status(200).json({ ok: true, action: 'resumed' });
+    }
+
+    // ACTION: Reconcile (lightweight, single-request reconciliation)
+    if (action === 'reconcile') {
+      try {
+        // 1) Recover stale 'sending' rows -> pending
+        const cutoff = new Date(Date.now() - STALE_SENDING_MS);
+        const staleSending = await db.collection('campaign_contacts').find({
+          campaignId: campaignObjectId,
+          status: 'sending',
+          lastAttemptAt: { $lt: cutoff },
+        }).project({ _id: 1, contactId: 1, step: 1 }).limit(RESUME_ENQUEUE_LIMIT).toArray();
+
+        if (staleSending.length > 0) {
+          const ids = staleSending.map(d => d._id);
+          await db.collection('campaign_contacts').updateMany(
+            { _id: { $in: ids } },
+            { $set: { status: 'pending', lastError: null, bgAttempts: 0 } }
+          );
+        }
+
+        // 2) Enqueue pending docs that do not currently have a job
+        const queuedSet = await getQueuedContactIdsForCampaign(id);
+        const pendingCursor = db.collection('campaign_contacts').find(
+          { campaignId: campaignObjectId, status: 'pending' },
+          { projection: { _id: 1, contactId: 1, step: 1 } }
+        ).limit(RESUME_ENQUEUE_LIMIT);
+        const pendingRows = await pendingCursor.toArray();
+
+        const enqueuePromises: Promise<any>[] = [];
+        for (const d of pendingRows) {
+          const cid = d.contactId ? (d.contactId.toString ? d.contactId.toString() : String(d.contactId)) : (d._id.toString ? d._id.toString() : String(d._id));
+          if (queuedSet.has(cid)) continue;
+          try {
+            enqueuePromises.push(
+              queue.add(
+                d.step ? 'followup' : 'initial',
+                { campaignId: id, contactId: cid, step: d.step },
+                { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
+              )
+            );
+          } catch (e) {
+            console.warn('Reconcile: failed to enqueue', e);
+          }
+        }
+        if (enqueuePromises.length) await Promise.allSettled(enqueuePromises);
+
+        // 3) Recalculate totals from DB (authoritative)
+        const agg = await db.collection('campaign_contacts').aggregate([
+          { $match: { campaignId: campaignObjectId } },
+          { $group: { _id: '$status', count: { $sum: 1 } } }
+        ]).toArray();
+
+        let pending = 0, sent = 0, failed = 0;
+        for (const r of agg) {
+          if (r._id === 'pending') pending = r.count;
+          else if (r._id === 'sent') sent = r.count;
+          else if (r._id === 'failed') failed = r.count;
+        }
+        const processed = sent + failed;
+        const intended = campaign.totals?.intended ?? (await db.collection('campaign_contacts').countDocuments({ campaignId: campaignObjectId }));
+
+        // Write back authoritative totals to DB
+        await db.collection('campaigns').updateOne(
+          { _id: campaignObjectId },
+          { $set: { 'totals.processed': processed, 'totals.sent': sent, 'totals.failed': failed } }
+        );
+
+        // Best-effort write to Redis meta
+        try {
+          await redis.hset(redisKey, { processed: String(processed), sent: String(sent), failed: String(failed), total: String(intended) });
+        } catch (_) {}
+
+        // 4) Decide canonical campaign status
+        let newStatus = campaign.status;
+        if (processed >= intended) {
+          if (failed > 0) newStatus = 'completed_with_failures';
+          else newStatus = 'completed';
+        } else {
+          newStatus = 'running';
+        }
+
+        // persist status if changed
+        if (newStatus !== campaign.status) {
+          await db.collection('campaigns').updateOne({ _id: campaignObjectId }, { $set: { status: newStatus, completedAt: (newStatus.startsWith('completed') ? new Date() : null) } } as any);
+          await safeHSet(redisKey, { status: newStatus });
+        }
+
+        await safePublish('campaign:new', { id, action: 'reconcile', requeued: enqueuePromises.length, recovered: staleSending.length, status: newStatus });
+
+        return res.status(200).json({ ok: true, requeued: enqueuePromises.length, recovered: staleSending.length, status: newStatus });
+      } catch (e) {
+        console.error('Reconcile failed', e);
+        return res.status(500).json({ error: 'reconcile-failed' });
+      }
     }
 
     // ACTION: Cancel
@@ -548,6 +642,17 @@ export default async function handler(
         console.warn('Failed to update redis counters during retryFailed', e);
       }
 
+      // Also correct processed counter because we are moving final failed -> pending (processed should drop)
+      try {
+        const currentProcessed = await safeGetMetaInt(redisKey, 'processed');
+        const decProc = Math.min(updated, currentProcessed);
+        if (decProc > 0) {
+          await redis.hincrby(redisKey, 'processed', -decProc);
+        }
+      } catch (e) {
+        console.warn('Failed to update processed counter during retryFailed', e);
+      }
+
       // Publish contact-level updates for each retried contact (best-effort)
       try {
         for (const doc of failedDocs) {
@@ -655,6 +760,16 @@ export default async function handler(
         }
       } catch (e) {
         console.warn('Failed to update redis counters during retryContact', e);
+      }
+
+      // Also decrement processed so totals align (we are un-finalizing a contact)
+      try {
+        const currentProcessed = await safeGetMetaInt(redisKey, 'processed');
+        if (currentProcessed > 0) {
+          await redis.hincrby(redisKey, 'processed', -1);
+        }
+      } catch (e) {
+        console.warn('Failed to update processed counter during retryContact', e);
       }
 
       // Publish contact update
