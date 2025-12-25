@@ -11,6 +11,14 @@ type Campaign = {
   createdAt: string;
 };
 
+type AttachmentEntry = {
+  name: string;
+  url: string;
+  contentType?: string | null;
+  size?: number;
+  source?: 'url' | 'path' | 'content';
+};
+
 export default function Dashboard() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [loading, setLoading] = useState(true);
@@ -26,11 +34,22 @@ export default function Dashboard() {
   const [previewCount, setPreviewCount] = useState<number | null>(null);
   const [previewSample, setPreviewSample] = useState<string[]>([]);
 
+  // attachments state for the new campaign
+  const [attachments, setAttachments] = useState<AttachmentEntry[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [urlToAdd, setUrlToAdd] = useState('');
+  const [urlName, setUrlName] = useState('');
+
   async function loadCampaigns() {
-    const res = await fetch('/api/campaign/list');
-    const data = await res.json();
-    setCampaigns(data.campaigns || []);
-    setLoading(false);
+    try {
+      const res = await fetch('/api/campaign/list');
+      const data = await res.json();
+      setCampaigns(data.campaigns || []);
+    } catch (e) {
+      console.error('Failed to load campaigns', e);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function loadSegments() {
@@ -63,7 +82,7 @@ export default function Dashboard() {
 
     const payload = {
       contacts: contactType === 'all' ? { type: 'all' } : { type: 'segment', value: segment },
-      initial: { subject, body },
+      initial: { subject, body, attachments },
       followUps: [],
     };
 
@@ -74,7 +93,7 @@ export default function Dashboard() {
     });
 
     if (!res.ok) {
-      const err = await res.json();
+      const err = await res.json().catch(() => null);
       alert('Preview failed: ' + (err?.error ?? res.statusText));
       return;
     }
@@ -95,10 +114,19 @@ export default function Dashboard() {
       return;
     }
 
+    // normalize attachments to include "source" so server validation passes
+    const normalized = attachments.map(a => ({
+      name: a.name,
+      source: a.source ?? 'url',
+      url: a.url,
+      contentType: a.contentType ?? undefined,
+      // note: start.ts will accept url/path/content per its validator
+    }));
+
     const payload = {
       name,
       contacts: contactType === 'all' ? { type: 'all' } : { type: 'segment', value: segment },
-      initial: { subject, body },
+      initial: { subject, body, attachments: normalized },
       followUps: [], // extend later with UI for follow-ups
     };
 
@@ -109,7 +137,7 @@ export default function Dashboard() {
     });
 
     if (!res.ok) {
-      const err = await res.json();
+      const err = await res.json().catch(() => null);
       alert('Launch failed: ' + (err?.error ?? res.statusText));
       return;
     }
@@ -123,8 +151,106 @@ export default function Dashboard() {
     setPreviewCount(null);
     setPreviewSample([]);
     setShowForm(false);
+    setAttachments([]);
     loadCampaigns();
     loadSegments();
+  }
+
+  // Helper: upload a file to server (base64)
+  async function uploadFile(file: File) {
+    setUploading(true);
+    try {
+      const reader = new FileReader();
+      const p = new Promise<{ url: string; filename: string; contentType?: string; size?: number }>((resolve, reject) => {
+        reader.onload = async () => {
+          try {
+            const dataUrl = reader.result as string;
+            const base64 = dataUrl.split(',')[1] ?? dataUrl;
+
+            const payload = {
+              filename: file.name,
+              content: base64,
+              contentType: file.type || null,
+            };
+
+            const res = await fetch('/api/uploads', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+
+            if (!res.ok) {
+              const errText = await res.text().catch(() => null);
+              let errJson = null;
+              try { errJson = JSON.parse(errText || ''); } catch {}
+              return reject(new Error(errJson?.error || errText || res.statusText || 'upload failed'));
+            }
+
+            const data = await res.json();
+            resolve({ url: data.url, filename: data.filename, contentType: data.contentType, size: data.size });
+          } catch (e) {
+            reject(e);
+          }
+        };
+        reader.onerror = () => reject(new Error('File read error'));
+        reader.readAsDataURL(file);
+      });
+
+      const result = await p;
+      // add to attachments; mark source as 'url' because uploaded files are hosted under /uploads
+      setAttachments((cur) => [...cur, { name: file.name, url: result.url, contentType: result.contentType ?? null, size: result.size, source: 'url' }]);
+    } catch (e: any) {
+      console.error('Upload failed', e);
+      alert('Upload failed: ' + (e?.message || String(e)));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    // upload each file sequentially to limit concurrency
+    (async () => {
+      for (let i = 0; i < files.length; i++) {
+        await uploadFile(files[i]);
+      }
+    })();
+    // reset input
+    e.currentTarget.value = '';
+  }
+
+  function removeAttachment(idx: number) {
+    setAttachments((cur) => {
+      const copy = [...cur];
+      copy.splice(idx, 1);
+      return copy;
+    });
+  }
+
+  // Add an external URL as an attachment (source = 'url')
+  function isValidUrl(u: string) {
+    try {
+      const parsed = new URL(u);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+
+  function addUrlAttachment() {
+    if (!urlToAdd) {
+      alert('Paste a URL first');
+      return;
+    }
+    if (!isValidUrl(urlToAdd.trim())) {
+      alert('Invalid URL (must be http or https)');
+      return;
+    }
+    const name = urlName?.trim() || new URL(urlToAdd).pathname.split('/').filter(Boolean).pop() || urlToAdd;
+    setAttachments((cur) => [...cur, { name, url: urlToAdd.trim(), contentType: null, source: 'url' }]);
+    setUrlToAdd('');
+    setUrlName('');
   }
 
   return (
@@ -205,6 +331,52 @@ export default function Dashboard() {
               </div>
             </div>
           )}
+
+          <div style={{ marginTop: 8 }}>
+            <div style={{ marginBottom: 6, fontWeight: 600 }}>Attachments</div>
+
+            <div style={{ marginBottom: 8 }}>
+              <input type="file" multiple onChange={handleFileInput} />
+              <div style={{ marginTop: 6, fontSize: 13, color: '#666' }}>
+                Files uploaded are stored under <code>/public/uploads</code> and included as URL attachments.
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ marginBottom: 6, fontSize: 13 }}>Or add a remote URL</div>
+              <input
+                placeholder="https://example.com/file.pdf"
+                value={urlToAdd}
+                onChange={(e) => setUrlToAdd(e.target.value)}
+                style={{ width: '100%', marginBottom: 6 }}
+              />
+              <input
+                placeholder="Optional display filename (e.g. brochure.pdf)"
+                value={urlName}
+                onChange={(e) => setUrlName(e.target.value)}
+                style={{ width: '100%', marginBottom: 6 }}
+              />
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button onClick={addUrlAttachment}>Add URL attachment</button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 8 }}>
+              {uploading && <div style={{ fontSize: 13 }}>Uploading…</div>}
+              {attachments.length === 0 && <div style={{ fontSize: 13, color: '#666' }}>No attachments</div>}
+              {attachments.length > 0 && (
+                <ul>
+                  {attachments.map((a, idx) => (
+                    <li key={a.url + idx} style={{ marginBottom: 6 }}>
+                      <a href={a.url} target="_blank" rel="noreferrer">{a.name}</a>
+                      {a.size ? <span style={{ marginLeft: 8, color: '#666', fontSize: 13 }}>{Math.round((a.size||0)/1024)} KB</span> : null}
+                      <button style={{ marginLeft: 8 }} onClick={() => removeAttachment(idx)}>Remove</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
 
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button onClick={previewCampaign}>Preview</button>

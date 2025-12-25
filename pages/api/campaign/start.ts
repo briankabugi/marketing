@@ -15,6 +15,82 @@ function chunkArray<T>(arr: T[], size = 1000): T[][] {
   return out;
 }
 
+/**
+ * Attachment validation rules:
+ * - Accept attachment metadata only (no file upload here).
+ * - Each attachment must have: name (string), source ('url'|'path'|'content')
+ * - If source === 'url' => url must be valid http(s) url
+ * - If source === 'path' => path must not contain '..' (basic traversal protection)
+ * - If source === 'content' => content should be base64 string (we don't decode here except minimal length check)
+ */
+type Attachment = {
+  name: string;
+  source: 'url' | 'path' | 'content';
+  url?: string;
+  path?: string;
+  content?: string; // base64
+  contentType?: string;
+};
+
+function isValidUrl(u: any) {
+  if (typeof u !== 'string') return false;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function hasDotDotSegments(p: string) {
+  // normalize and check for .. segments (basic)
+  return p.split('/').some(segment => segment === '..');
+}
+
+function validateAttachments(arr: any): Attachment[] {
+  if (!arr) return [];
+  if (!Array.isArray(arr)) throw new Error('attachments must be an array');
+  const out: Attachment[] = [];
+  const MAX_ATTACHMENTS = 10;
+  const MAX_INLINE_BASE64_BYTES = 10 * 1024 * 1024; // 10 MB cap for inline base64 content
+
+  if (arr.length > MAX_ATTACHMENTS) {
+    throw new Error(`Too many attachments; max ${MAX_ATTACHMENTS}`);
+  }
+
+  for (const a of arr) {
+    if (!a || typeof a !== 'object') throw new Error('Invalid attachment entry');
+    const name = typeof a.name === 'string' && a.name.trim() ? a.name.trim() : null;
+    const source = (a.source === 'url' || a.source === 'path' || a.source === 'content') ? a.source : null;
+    const contentType = typeof a.contentType === 'string' ? a.contentType.trim() : undefined;
+
+    if (!name) throw new Error('Attachment missing name');
+    if (!source) throw new Error('Attachment missing valid source');
+
+    if (source === 'url') {
+      if (!isValidUrl(a.url)) throw new Error(`Attachment url invalid for ${name}`);
+      out.push({ name, source, url: a.url, contentType });
+    } else if (source === 'path') {
+      if (typeof a.path !== 'string' || !a.path.trim()) throw new Error(`Attachment path missing for ${name}`);
+      if (hasDotDotSegments(a.path)) throw new Error(`Attachment path contains .. segments (not allowed): ${name}`);
+      // prefer relative paths for safety; do not resolve/validate existence here
+      out.push({ name, source, path: a.path.trim(), contentType });
+    } else if (source === 'content') {
+      if (typeof a.content !== 'string' || !a.content.trim()) throw new Error(`Attachment content missing for ${name}`);
+      // crude base64 length estimate: base64 length * 3/4
+      const estimatedBytes = Math.floor((a.content.length * 3) / 4);
+      if (estimatedBytes > MAX_INLINE_BASE64_BYTES) throw new Error(`Attachment ${name} exceeds inline size limit`);
+      // Basic base64 characters validation (not perfect)
+      if (!/^[A-Za-z0-9+/=\s]+$/.test(a.content)) {
+        throw new Error(`Attachment ${name} content is not valid base64`);
+      }
+      out.push({ name, source, content: a.content.replace(/\s+/g, ''), contentType });
+    }
+  }
+
+  return out;
+}
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
@@ -37,6 +113,22 @@ export default async function handler(
     return res.status(400).json({ error: 'Invalid contact selection' });
   }
 
+  // Validate and normalize attachments (if provided)
+  try {
+    if (initial.attachments) {
+      initial.attachments = validateAttachments(initial.attachments);
+    }
+    if (Array.isArray(followUps)) {
+      for (let i = 0; i < followUps.length; i++) {
+        if (followUps[i]?.attachments) {
+          followUps[i].attachments = validateAttachments(followUps[i].attachments);
+        }
+      }
+    }
+  } catch (e: any) {
+    return res.status(400).json({ error: `Invalid attachments: ${e.message || String(e)}` });
+  }
+
   const client = await clientPromise;
   const db = client.db('PlatformData');
 
@@ -57,8 +149,8 @@ export default async function handler(
 
   const createdAt = new Date();
 
-  // --- Create campaign document ---
-  const campaignDoc = {
+  // --- Create campaign document (persist attachments metadata) ---
+  const campaignDoc: any = {
     name,
     contacts,
     initial,
@@ -113,9 +205,11 @@ export default async function handler(
       createdAt: createdAt.toISOString(),
     });
 
+    // Persist an enriched definition (includes attachments metadata) for the worker to pick up
+    const definition = { initial, followUps, name, contacts };
     await redis.set(
       `campaign:${campaignId}:definition`,
-      JSON.stringify({ initial, followUps, name, contacts })
+      JSON.stringify(definition)
     );
 
     await redis.sadd('campaign:all', campaignId);

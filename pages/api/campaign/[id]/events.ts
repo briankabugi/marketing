@@ -4,10 +4,7 @@ import { redis, subscribeToChannels } from '../../../../lib/redis';
 
 /**
  * SSE endpoint that subscribes to Redis channels and forwards events to clients.
- * - Keeps the connection alive with periodic heartbeats.
- * - Supports node-redis v4 subscribe signature and ioredis-style subscribe.
- * - Forwards campaign-level events as "campaign" and contact-level as "contact".
- * - Protects against malformed JSON and newline payload issues by serializing here.
+ * Forwards campaign-level events as "campaign" and contact-level as "contact".
  */
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -24,13 +21,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   try {
-    res.flushHeaders();
+    res.flushHeaders?.();
   } catch {}
 
   // Duplicate Redis client for pub/sub
   const sub = (redis as any).duplicate();
+
   try {
-    await sub.connect();
+    // try to connect (subscribeToChannels has its own guard)
+    await sub.connect().catch((err: any) => {
+      // connect may already be in-progress; ignore
+      // but log for debugging
+      if (err && String(err).includes('already connecting')) {
+        console.warn('subscribe: sub.connect already connecting — continuing');
+      } else {
+        console.warn('subscribe: sub.connect failed (continuing)', err);
+      }
+    });
   } catch (err) {
     console.error('Failed to connect redis subscriber', err);
     res.write(`event: error\n`);
@@ -41,6 +48,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   const channels = [
     `campaign:${id}:contact_update`,
+    `campaign:${id}:events`,
     'campaign:new',
   ];
 
@@ -66,10 +74,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         payload = { raw: String(message) };
       }
 
+      console.log('[SSE] redis message', channel, message);
+
       if (channel === 'campaign:new') {
         writeEvent('campaign', payload);
-      } else {
+      } else if (channel.endsWith(':contact_update')) {
         writeEvent('contact', payload);
+      } else {
+        // generic events channel
+        writeEvent('campaign_event', { channel, payload });
       }
     } catch (e) {
       console.warn('messageHandler error', e);
@@ -92,11 +105,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     } catch {}
   }, heartbeatMs);
 
-  // Cleanup
+  // Cleanup on close
   req.on('close', async () => {
     clearInterval(heartbeat);
-    try { await sub.unsubscribe(channels); } catch {}
-    try { await sub.quit(); } catch {}
+    try {
+      // remove our message handler if present
+      if ((sub as any).__subscribe_to_channels_on_message) {
+        try { sub.off('message', (sub as any).__subscribe_to_channels_on_message); } catch {}
+      }
+      try { await sub.unsubscribe(channels); } catch {}
+      try { await sub.quit(); } catch {}
+    } catch (e) {
+      console.warn('Error during SSE cleanup', e);
+    }
     try { res.end(); } catch {}
   });
 }

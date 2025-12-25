@@ -1,4 +1,3 @@
-// pages/api/campaign/[id]/insight.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -36,7 +35,7 @@ export default async function handler(
       console.warn('Redis unavailable, falling back to Mongo', e);
     }
 
-    // --- Breakdown from MongoDB ledger (authoritative for rows) ---
+    // --- Breakdown from MongoDB ledger ---
     const aggregation = await db
       .collection('campaign_contacts')
       .aggregate([
@@ -52,7 +51,6 @@ export default async function handler(
       else if (row._id === 'failed') breakdown.failed = row.count;
     }
 
-    // --- Totals derived from breakdown (ensure consistency) ---
     const totals = {
       intended: Number(redisMeta?.total ?? campaign.totals?.intended ?? 0),
       processed: breakdown.sent + breakdown.failed,
@@ -60,7 +58,7 @@ export default async function handler(
       failed: breakdown.failed,
     };
 
-    // --- Recent failures (same as before) ---
+    // --- Recent failures ---
     const recentFailures = await db
       .collection('campaign_contacts')
       .find({ campaignId, status: 'failed' })
@@ -68,19 +66,66 @@ export default async function handler(
       .limit(10)
       .toArray();
 
-    // --- Status resolution: use campaign.status as source of truth ---
-    const resolvedStatus = campaign.status;
+    // --------------------------------------------------
+    // Engagement analytics (campaign_events)
+    // --------------------------------------------------
+
+    const events = db.collection('campaign_events');
+
+    // Total opens / clicks
+    const [openCount, clickCount] = await Promise.all([
+      events.countDocuments({ campaignId, type: 'open' }),
+      events.countDocuments({ campaignId, type: 'click' }),
+    ]);
+
+    // Unique openers / clickers
+    const [uniqueOpeners, uniqueClickers] = await Promise.all([
+      events.distinct('contactId', { campaignId, type: 'open' }),
+      events.distinct('contactId', { campaignId, type: 'click' }),
+    ]);
+
+    // Top clicked links
+    const topLinks = await events
+      .aggregate([
+        { $match: { campaignId, type: 'click' } },
+        { $group: { _id: '$url', clicks: { $sum: 1 } } },
+        { $sort: { clicks: -1 } },
+        { $limit: 10 },
+      ])
+      .toArray();
+
+    const sent = breakdown.sent || 0;
+
+    const engagement = {
+      opens: {
+        total: openCount,
+        unique: uniqueOpeners.length,
+        rate: sent > 0 ? uniqueOpeners.length / sent : 0,
+      },
+      clicks: {
+        total: clickCount,
+        unique: uniqueClickers.length,
+        rate: sent > 0 ? uniqueClickers.length / sent : 0,
+      },
+      links: topLinks.map(l => ({
+        url: l._id,
+        clicks: l.clicks,
+      })),
+    };
+
+    // --------------------------------------------------
 
     res.status(200).json({
       campaign: {
         id: campaign._id.toString(),
         name: campaign.name,
-        status: resolvedStatus,
+        status: campaign.status,
         createdAt: campaign.createdAt,
         completedAt: campaign.completedAt ?? null,
       },
       totals,
       breakdown,
+      engagement,
       recentFailures: recentFailures.map((f) => ({
         contactId: f.contactId?.toString?.() ?? f.contactId,
         email: f.email,
@@ -88,7 +133,6 @@ export default async function handler(
         error: f.lastError ?? null,
         lastAttemptAt: f.lastAttemptAt,
       })),
-      // expose MAX_ATTEMPTS so UI can show attempts / max
       maxAttempts: MAX_ATTEMPTS,
     });
   } catch (err) {

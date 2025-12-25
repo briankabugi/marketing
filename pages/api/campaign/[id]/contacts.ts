@@ -1,183 +1,163 @@
+// pages/api/campaign/[id]/contacts.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
-import { redis } from '../../../../lib/redis';
 import { ObjectId } from 'mongodb';
 
-const MAX_PAGE_SIZE = 200;
-const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 3);
-
-function safeNum(v: any, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : fallback;
-}
-
-/**
- * Build a simple preview object from either the step or the campaign definition.
- * Kept for compatibility with earlier clients; not required for the current UI.
- */
-async function buildPreviewForRow(campaignId: string, campaignDoc: any, row: any) {
-  try {
-    const key = `campaign:${campaignId}:definition`;
-    const raw = await redis.get(key);
-    if (raw) {
-      const definition = JSON.parse(raw);
-      if (row.step && row.step.body) {
-        return { subject: row.step.subject || definition.initial?.subject || campaignDoc?.name || '', body: row.step.body || '' };
-      }
-      return { subject: definition.initial?.subject || campaignDoc?.name || '', body: definition.initial?.body || campaignDoc?.body || '' };
-    }
-  } catch (e) {
-    // ignore and continue to fallback
+function tryParseObjectId(s: any) {
+  if (!s) return null;
+  if (typeof s === 'object' && s instanceof ObjectId) return s;
+  if (typeof s === 'string' && /^[0-9a-fA-F]{24}$/.test(s)) {
+    try { return new ObjectId(s); } catch { return null; }
   }
-
-  const subject = row.step?.subject || campaignDoc?.subject || campaignDoc?.title || campaignDoc?.name || `Campaign ${campaignId}`;
-  const body = row.step?.body || campaignDoc?.body || campaignDoc?.content || '';
-  return { subject, body };
+  return null;
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+
   const { id } = req.query;
   if (!id || typeof id !== 'string') return res.status(400).json({ error: 'Invalid campaign id' });
 
-  // Query params: page, pageSize, status, search, sort, viewAll
-  const page = safeNum(req.query.page, 1);
-  const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, safeNum(req.query.pageSize, 25)));
-  const status = typeof req.query.status === 'string' && req.query.status.length ? req.query.status : undefined;
-  const search = typeof req.query.search === 'string' && req.query.search.length ? req.query.search : undefined;
-  const sort = req.query.sort === 'asc' ? 1 : -1;
-  const viewAll = req.query.viewAll === 'true' || req.query.viewAll === '1';
+  const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+  const page = Math.max(1, Number(req.query.page ? Number(req.query.page) : 1));
+  const pageSize = Math.max(1, Number(req.query.pageSize ? Number(req.query.pageSize) : 25));
 
   try {
     const client = await clientPromise;
     const db = client.db('PlatformData');
-    const campaignId = new ObjectId(id);
 
-    const campaignDoc = await db.collection('campaigns').findOne({ _id: campaignId });
-    if (!campaignDoc) return res.status(404).json({ error: 'Campaign not found' });
+    const campaignIdStr = String(id);
+    const campaignIdObj = tryParseObjectId(campaignIdStr);
 
-    const filter: any = { campaignId };
+    // Base filter for campaign_contacts
+    const baseFilter: any = { campaignId: campaignIdObj ?? campaignIdStr };
+    if (status && status !== 'all') baseFilter.status = status;
 
-    if (status) filter.status = status;
-    if (search) {
-      // search against email or contact snapshot fields
-      filter.$or = [
-        { email: { $regex: new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } },
-        { contactIdStr: { $regex: new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } },
-      ];
-    }
+    // Total count
+    let total = await db.collection('campaign_contacts').countDocuments(baseFilter);
 
-    // Pagination calculation
-    const total = await db.collection('campaign_contacts').countDocuments(filter);
-
-    // If viewAll requested, we'll return up to a server cap
-    let effectiveLimit = pageSize;
-    let skip = (page - 1) * pageSize;
-    if (viewAll) {
-      const viewAllCap = Math.min(5000, Math.max(pageSize, total));
-      effectiveLimit = viewAllCap;
-      skip = 0;
-    }
-
-    const cursor = db
-      .collection('campaign_contacts')
-      .find(filter, {
-        projection: {
-          _id: 1,
-          contactId: 1,
-          email: 1,
-          status: 1,
-          attempts: 1,
-          bgAttempts: 1,
-          lastAttemptAt: 1,
-          lastError: 1,
-          step: 1,
-        },
-      })
-      .sort({ lastAttemptAt: sort, email: 1 })
-      .skip(skip)
-      .limit(effectiveLimit);
+    // Pagination
+    const skip = (page - 1) * pageSize;
+    const cursor = db.collection('campaign_contacts').find(baseFilter).sort({ createdAt: 1 }).skip(skip).limit(pageSize);
 
     const rows = await cursor.toArray();
 
-    // Collect contactIds that need email backfill
-    const contactIdToRows: Record<string, any[]> = {};
-    const objectIdsToLookup: ObjectId[] = [];
-    for (const r of rows) {
-      // Normalize contactId to string for mapping
-      const cidRaw = r.contactId ?? r.contactIdStr ?? (r._id ? r._id.toString() : null);
-      const cidStr = cidRaw ? String(cidRaw) : null;
+    // Collect contactIds present on this page
+    const contactIdValues = rows.map(r => r.contactId).filter(Boolean);
 
-      // if email exists in ledger row, no need to lookup
-      if (!r.email && cidStr) {
-        // try to parse as ObjectId for lookup
+    // Build arrays for ObjectId vs string contactId lookups
+    const contactObjIds = contactIdValues
+      .map((v) => {
         try {
-          const oid = new ObjectId(cidStr);
-          objectIdsToLookup.push(oid);
-          contactIdToRows[cidStr] = contactIdToRows[cidStr] || [];
-          contactIdToRows[cidStr].push(r);
-        } catch {
-          // not an ObjectId — still record so we can attempt fallback later
-          contactIdToRows[cidStr] = contactIdToRows[cidStr] || [];
-          contactIdToRows[cidStr].push(r);
+          if (typeof v === 'object' && v instanceof ObjectId) return v;
+          if (typeof v === 'string' && /^[0-9a-fA-F]{24}$/.test(v)) return new ObjectId(v);
+        } catch {}
+        return null;
+      })
+      .filter(Boolean) as ObjectId[];
+
+    const stringContactIds = contactIdValues
+      .map((v) => (typeof v === 'string' ? v : (v && v.toString ? v.toString() : null)))
+      .filter(Boolean) as string[];
+
+    // Fetch contact details (email) for these contactIds
+    let contactDocsMap: Record<string, any> = {};
+    if (contactObjIds.length || stringContactIds.length) {
+      const contactQuery: any = { $or: [] as any[] };
+      if (contactObjIds.length) contactQuery.$or.push({ _id: { $in: contactObjIds } });
+      if (stringContactIds.length) contactQuery.$or.push({ _id: { $in: stringContactIds } });
+      if (contactQuery.$or.length > 0) {
+        const contactDocs = await db.collection('contacts').find(contactQuery).project({ email: 1 }).toArray();
+        for (const c of contactDocs) contactDocsMap[(c._id && c._id.toString ? c._id.toString() : String(c._id))] = c;
+      }
+    }
+
+    // Aggregate campaign_events for these contactIds (opens & clicks)
+    let openLookup: Record<string, string | null> = {};
+    let clickLookup: Record<string, string | null> = {};
+
+    if (contactIdValues.length > 0) {
+      const contactMatchClauses: any[] = [];
+      if (contactObjIds.length) contactMatchClauses.push({ contactId: { $in: contactObjIds } });
+      if (stringContactIds.length) contactMatchClauses.push({ contactId: { $in: stringContactIds } });
+
+      // Build campaignId match that copes with ObjectId or string
+      const campaignIdMatch: any = campaignIdObj ? { $or: [{ campaignId: campaignIdObj }, { campaignId: campaignIdStr }] } : { campaignId: campaignIdStr };
+
+      try {
+        const openAgg = await db.collection('campaign_events').aggregate([
+          { $match: { $and: [ campaignIdMatch, { type: 'open' }, { $or: contactMatchClauses } ] } },
+          { $group: { _id: '$contactId', lastOpenAt: { $max: '$createdAt' }, opens: { $sum: 1 } } },
+        ]).toArray();
+
+        for (const o of openAgg) {
+          const key = o._id && o._id.toString ? o._id.toString() : String(o._id);
+          openLookup[key] = o.lastOpenAt ? (new Date(o.lastOpenAt)).toISOString() : null;
         }
+      } catch (e) {
+        console.warn('Failed to aggregate opens for contacts page', e);
+      }
+
+      try {
+        const campaignIdMatch2: any = campaignIdObj ? { $or: [{ campaignId: campaignIdObj }, { campaignId: campaignIdStr }] } : { campaignId: campaignIdStr };
+
+        const clickAgg = await db.collection('campaign_events').aggregate([
+          { $match: { $and: [ campaignIdMatch2, { type: 'click' }, { $or: contactMatchClauses } ] } },
+          { $group: { _id: '$contactId', lastClickAt: { $max: '$createdAt' }, clicks: { $sum: 1 } } },
+        ]).toArray();
+
+        for (const c of clickAgg) {
+          const key = c._id && c._id.toString ? c._id.toString() : String(c._id);
+          clickLookup[key] = c.lastClickAt ? (new Date(c.lastClickAt)).toISOString() : null;
+        }
+      } catch (e) {
+        console.warn('Failed to aggregate clicks for contacts page', e);
       }
     }
 
-    // Query contacts collection for ObjectId matches
-    const idToEmail: Record<string, string> = {};
-    if (objectIdsToLookup.length > 0) {
-      const contactsRaw = await db
-        .collection('contacts')
-        .find({ _id: { $in: objectIdsToLookup } }, { projection: { _id: 1, email: 1 } })
-        .toArray();
+    // Build response items
+    const items = rows.map((r: any) => {
+      const cidKey = r.contactId && r.contactId.toString ? r.contactId.toString() : String(r.contactId ?? '');
+      const contactDoc = contactDocsMap[cidKey];
+      const email = contactDoc?.email ?? r.email ?? null;
 
-      for (const c of contactsRaw) {
-        if (!c || !c._id) continue;
-        idToEmail[c._id.toString()] = c.email ?? '';
-      }
-    }
+      const lastOpenAt = openLookup[cidKey] ?? null;
+      const lastClickAt = clickLookup[cidKey] ?? null;
 
-    // Build response items — fill email from ledger or from contacts lookup, or null
-    const items: any[] = [];
-    for (const r of rows) {
-      const cidRaw = r.contactId ?? r.contactIdStr ?? (r._id ? r._id.toString() : null);
-      const cidStr = cidRaw ? String(cidRaw) : null;
-      let email = r.email ?? null;
-      if (!email && cidStr) {
-        email = idToEmail[cidStr] ?? null;
-      }
-
-      // As a last resort, try to see if the ledger row stores an email in another field
-      if (!email && (r.contactEmail || r.emailSnapshot)) {
-        email = r.contactEmail ?? r.emailSnapshot ?? null;
-      }
-
-      // keep preview for compatibility (may be empty)
-      const preview = await buildPreviewForRow(id, campaignDoc, r);
-
-      items.push({
-        id: r._id?.toString?.() ?? r._id,
-        contactId: cidStr,
+      return {
+        id: r._id?.toString?.() ?? String(r._id),
+        contactId: r.contactId && r.contactId.toString ? r.contactId.toString() : String(r.contactId ?? null),
         email,
-        status: r.status,
-        attempts: r.attempts ?? 0,
-        bgAttempts: r.bgAttempts ?? 0,
-        lastAttemptAt: r.lastAttemptAt ?? null,
+        status: r.status ?? null,
+        attempts: typeof r.attempts === 'number' ? r.attempts : 0,
+        bgAttempts: typeof r.bgAttempts === 'number' ? r.bgAttempts : 0,
+        lastAttemptAt: r.lastAttemptAt ? new Date(r.lastAttemptAt).toISOString() : null,
         lastError: r.lastError ?? null,
-        previewSubject: preview.subject ?? '',
-        previewBody: preview.body ?? '',
-      });
+        opened: !!lastOpenAt,
+        lastOpenAt,
+        clicked: !!lastClickAt,
+        lastClickAt,
+      };
+    });
+
+    // Available statuses
+    let availableStatuses: string[] = [];
+    try {
+      availableStatuses = await db.collection('campaign_contacts').distinct('status', { campaignId: campaignIdObj ?? campaignIdStr });
+      availableStatuses = (availableStatuses || []).filter(Boolean);
+    } catch (e) {
+      // ignore
     }
+
+    const pages = Math.max(1, Math.ceil(total / pageSize));
 
     return res.status(200).json({
-      campaignId: id,
+      items,
       total,
       page,
-      pageSize: effectiveLimit,
-      pages: viewAll ? 1 : Math.max(1, Math.ceil(total / pageSize)),
-      items,
-      maxAttempts: MAX_ATTEMPTS,
-      viewAll: !!viewAll,
+      pages,
+      pageSize,
+      availableStatuses,
     });
   } catch (err) {
     console.error('Contacts API error', err);

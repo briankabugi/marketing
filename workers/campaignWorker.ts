@@ -5,6 +5,9 @@ import { redis } from '../lib/redis';
 import clientPromise from '../lib/mongo';
 import nodemailer from 'nodemailer';
 import { ObjectId } from 'mongodb';
+import fs from 'fs/promises';
+import path from 'path';
+import { URL } from 'url';
 
 const queue = new Queue('campaigns', { connection: redis });
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 3);
@@ -22,6 +25,12 @@ const FAILURE_RATE_STRICT = Number(process.env.EMAIL_FAILURE_STRICT_RATE || 0.15
 
 const DOMAIN_BLOCK_TTL_SEC = Number(process.env.EMAIL_DOMAIN_BLOCK_TTL || 60 * 5);
 const GLOBAL_BLOCK_TTL_SEC = Number(process.env.EMAIL_GLOBAL_BLOCK_TTL || 60 * 5);
+
+// PUBLIC_BASE_URL must be set in .env (e.g. https://mail.example.com)
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
+if (!PUBLIC_BASE_URL) {
+  console.warn('Warning: PUBLIC_BASE_URL is not set. Tracking links will not be generated properly. Set PUBLIC_BASE_URL to your public domain or ngrok HTTPS URL and restart the worker.');
+}
 
 // --- Nodemailer transporter ---
 const transporter = nodemailer.createTransport({
@@ -356,6 +365,165 @@ async function startReconciler() {
 startReconciler().catch((e) => console.warn('startReconciler error', e));
 
 // ---------------------
+// Helper: HTML rewriting for tracking (PATH-based endpoints)
+// ---------------------
+
+/**
+ * Safely rewrites all http(s) href attributes to point to our click-tracking endpoint.
+ * Leaves mailto:, tel:, and fragment links untouched.
+ *
+ * New path format:
+ *   `${PUBLIC_BASE_URL}/api/track/click/{campaignId}/{contactId}?u={base64_destination}`
+ */
+function rewriteLinksForTracking(html: string, campaignId: string, contactId: string) {
+  if (!html || !PUBLIC_BASE_URL) return html;
+
+  // Regex to capture href value including surrounding quotes
+  const hrefRegex = /href\s*=\s*(?:'([^']*)'|"([^"]*)"|([^>\s]+))/gi;
+
+  const replaced = html.replace(hrefRegex, (match, singleQuoted, doubleQuoted, noQuote) => {
+    const original = singleQuoted ?? doubleQuoted ?? noQuote ?? '';
+    const trimmed = String(original).trim();
+
+    // Skip empty or non-http links
+    if (!trimmed) return match;
+    if (/^mailto:/i.test(trimmed)) return match;
+    if (/^tel:/i.test(trimmed)) return match;
+    if (/^#/i.test(trimmed)) return match;
+    if (!/^https?:\/\//i.test(trimmed)) return match;
+
+    try {
+      // Encode destination as base64 to preserve query strings and unsafe chars
+      const b64 = Buffer.from(trimmed, 'utf8').toString('base64');
+      const clickUrl = `${PUBLIC_BASE_URL}/api/track/click/${encodeURIComponent(campaignId)}/${encodeURIComponent(contactId)}?u=${encodeURIComponent(b64)}`;
+      // preserve original quote style
+      if (singleQuoted !== undefined) {
+        return `href='${clickUrl}'`;
+      } else if (doubleQuoted !== undefined) {
+        return `href="${clickUrl}"`;
+      } else {
+        return `href=${clickUrl}`;
+      }
+    } catch (e) {
+      return match;
+    }
+  });
+
+  return replaced;
+}
+
+/**
+ * Injects a 1x1 tracking pixel (img) before </body> if present, otherwise appends to end of HTML.
+ *
+ * New path format:
+ *   `${PUBLIC_BASE_URL}/api/track/open/{campaignId}/{contactId}?t={ts}`
+ */
+function injectOpenPixel(html: string, campaignId: string, contactId: string) {
+  if (!html || !PUBLIC_BASE_URL) return html;
+  const ts = Date.now();
+  const pixelUrl = `${PUBLIC_BASE_URL}/api/track/open/${encodeURIComponent(campaignId)}/${encodeURIComponent(contactId)}?t=${ts}`;
+  const imgTag = `<img src="${pixelUrl}" alt="" style="width:1px;height:1px;display:block;max-height:1px;max-width:1px;border:0;margin:0;padding:0;" />`;
+
+  const lower = html.toLowerCase();
+  const bodyClose = lower.lastIndexOf('</body>');
+  if (bodyClose !== -1) {
+    return html.slice(0, bodyClose) + imgTag + html.slice(bodyClose);
+  } else {
+    return html + imgTag;
+  }
+}
+
+// ---------------------
+// Attachment helper: fetch remote URL or read local path
+// ---------------------
+async function buildAttachments(definitionPart: any) {
+  const attachmentsOut: any[] = [];
+  if (!definitionPart || !Array.isArray(definitionPart.attachments)) return attachmentsOut;
+
+  for (const att of definitionPart.attachments) {
+    try {
+      if (!att) continue;
+      const source = att.source || att.type || 'url';
+      if (source === 'url' && att.url) {
+        // fetch remote resource
+        try {
+          const res = await fetch(att.url);
+          if (!res.ok) {
+            console.warn('Failed to fetch attachment URL', att.url, res.status);
+            continue;
+          }
+          const buf = Buffer.from(await res.arrayBuffer());
+          const contentType = res.headers.get('content-type') || att.contentType || 'application/octet-stream';
+          let filename = att.name || path.basename(new URL(att.url).pathname || 'attachment');
+          if (!filename) filename = `attachment-${Date.now()}`;
+          attachmentsOut.push({
+            filename,
+            content: buf,
+            contentType,
+          });
+        } catch (e) {
+          console.warn('Attachment fetch failed', att.url, e);
+          continue;
+        }
+      } else if ((source === 'path' || source === 'upload' || source === 'local') && att.path) {
+        // local file path - read from disk
+        try {
+          const resolved = path.isAbsolute(att.path) ? att.path : path.join(process.cwd(), att.path);
+          const buf = await fs.readFile(resolved);
+          const filename = att.name || path.basename(resolved);
+          attachmentsOut.push({
+            filename,
+            content: buf,
+            contentType: att.contentType || 'application/octet-stream',
+          });
+        } catch (e) {
+          console.warn('Failed to read local attachment', att.path, e);
+          continue;
+        }
+      } else if (att.content && att.name) {
+        // inline base64 content or Buffer-like
+        try {
+          let content = att.content;
+          if (typeof content === 'string') {
+            // base64 encoded check
+            if (/^[A-Za-z0-9+/=]+\s*$/.test(content) && (content.length % 4 === 0)) {
+              // assume base64
+              const buf = Buffer.from(content, 'base64');
+              attachmentsOut.push({
+                filename: att.name,
+                content: buf,
+                contentType: att.contentType || 'application/octet-stream',
+              });
+            } else {
+              attachmentsOut.push({
+                filename: att.name,
+                content,
+                contentType: att.contentType || 'text/plain',
+              });
+            }
+          } else {
+            attachmentsOut.push({
+              filename: att.name,
+              content,
+              contentType: att.contentType || 'application/octet-stream',
+            });
+          }
+        } catch (e) {
+          console.warn('Failed to handle inline attachment', e);
+          continue;
+        }
+      } else {
+        console.warn('Unknown attachment entry, skipping', att);
+      }
+    } catch (e) {
+      console.warn('Unhandled attachment processing error', e);
+    }
+  }
+
+  return attachmentsOut;
+}
+
+// ---------------------
 // Worker logic
 // ---------------------
 
@@ -487,6 +655,28 @@ const worker = new Worker(
     const subject = isInitial ? definition.initial?.subject : (step?.subject || definition.initial?.subject);
     const body = isInitial ? definition.initial?.body : (step?.body || definition.initial?.body);
 
+    // Prepare tracked HTML (rewrite links + inject pixel) and attachments
+    let trackedHtml = body;
+    try {
+      if (typeof trackedHtml === 'string' && PUBLIC_BASE_URL) {
+        trackedHtml = rewriteLinksForTracking(trackedHtml, campaignId, contactId);
+        trackedHtml = injectOpenPixel(trackedHtml, campaignId, contactId);
+      }
+    } catch (e) {
+      console.warn('Failed to rewrite or inject tracking into HTML, falling back to original body', e);
+      trackedHtml = body;
+    }
+
+    // Build attachments from definition (best-effort)
+    let attachments: any[] = [];
+    try {
+      const defPart = isInitial ? definition.initial : step ?? definition.initial;
+      attachments = await buildAttachments(defPart);
+    } catch (e) {
+      console.warn('Failed to build attachments', e);
+      attachments = [];
+    }
+
     // mark sending & bgAttempts
     try {
       await db.collection('campaign_contacts').updateOne(
@@ -516,12 +706,23 @@ const worker = new Worker(
     try {
       await new Promise((r) => setTimeout(r, randomSmallDelay()));
 
-      await transporter.sendMail({
+      const mailOptions: any = {
         from: process.env.SMTP_FROM,
         to: contact.email,
         subject,
-        html: body,
-      });
+        html: trackedHtml,
+      };
+
+      if (attachments && attachments.length) {
+        mailOptions.attachments = attachments.map(a => {
+          // nodemailer understands either path or content buffer
+          if (a.path && !a.content) return { filename: a.filename, path: a.path, contentType: a.contentType };
+          if (a.content) return { filename: a.filename, content: a.content, contentType: a.contentType };
+          return { filename: a.filename, content: a.content, contentType: a.contentType };
+        });
+      }
+
+      await transporter.sendMail(mailOptions);
 
       try {
         await db.collection('campaign_contacts').updateOne(
@@ -657,7 +858,7 @@ const worker = new Worker(
   }
 );
 
-console.log('Campaign worker running with Redis-backed dynamic throttling and domain rate control');
+console.log('Campaign worker running with Redis-backed dynamic throttling and domain rate control (html tracking + attachments enabled)');
 
 worker.on('completed', async (job) => {
   // light listener

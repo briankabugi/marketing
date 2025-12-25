@@ -2,9 +2,13 @@
   "/_app": "pages/_app.js",
   "/_error": "pages/_error.js",
   "/_document": "pages/_document.js",
-  "/": "pages/index.js",
   "/campaigns/[id]": "pages/campaigns/[id].js",
-  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js",
+  "/": "pages/index.js",
   "/api/campaign/[id]/contacts": "pages/api/campaign/[id]/contacts.js",
-  "/api/campaign/[id]/events": "pages/api/campaign/[id]/events.js"
+  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js",
+  "/api/contacts": "pages/api/contacts.js",
+  "/api/campaign/list": "pages/api/campaign/list.js",
+  "/api/contacts/segments": "pages/api/contacts/segments.js",
+  "/api/campaign/[id]/events": "pages/api/campaign/[id]/events.js",
+  "/api/track/open/[campaign]/[contact]": "pages/api/track/open/[campaign]/[contact].js"
 }

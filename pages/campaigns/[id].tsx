@@ -12,6 +12,11 @@ type ContactRow = {
   lastAttemptAt?: string | null;
   lastError?: string | null;
   bgAttempts?: number;
+  // engagement
+  opened?: boolean;
+  clicked?: boolean;
+  lastOpenAt?: string | null;
+  lastClickAt?: string | null;
 };
 
 type InsightPayload = {
@@ -35,6 +40,11 @@ type InsightPayload = {
   };
   recentFailures: Array<any>;
   maxAttempts: number;
+  engagement?: {
+    opens?: { total: number; unique: number; rate: number };
+    clicks?: { total: number; unique: number; rate: number };
+    links?: Array<{ url?: string; clicks: number }>;
+  };
 };
 
 export default function CampaignInsight() {
@@ -46,6 +56,8 @@ export default function CampaignInsight() {
   const [totals, setTotals] = React.useState<any>(null);
   const [recentFailures, setRecentFailures] = React.useState<any[]>([]);
   const [maxAttempts, setMaxAttempts] = React.useState<number>(3);
+
+  const [engagement, setEngagement] = React.useState<InsightPayload['engagement'] | null>(null);
 
   const [items, setItems] = React.useState<ContactRow[]>([]);
   const [total, setTotal] = React.useState<number>(0);
@@ -122,6 +134,7 @@ export default function CampaignInsight() {
       setTotals(body.totals);
       setRecentFailures(body.recentFailures || []);
       setMaxAttempts(body.maxAttempts ?? 3);
+      setEngagement(body.engagement ?? null);
 
       // Quick queued estimate (intended - processed)
       const intended = Number(body.totals?.intended ?? 0);
@@ -176,6 +189,11 @@ export default function CampaignInsight() {
         lastAttemptAt: it.lastAttemptAt ?? null,
         lastError: it.lastError ?? null,
         bgAttempts: (typeof it.bgAttempts === 'number' ? Math.max(1, it.bgAttempts) : (typeof it.bgAttempts === 'undefined' ? 0 : Number(it.bgAttempts))),
+        // engagement fields (if the API returns them)
+        opened: !!it.opened,
+        clicked: !!it.clicked,
+        lastOpenAt: it.lastOpenAt ?? null,
+        lastClickAt: it.lastClickAt ?? null,
       })) as ContactRow[];
 
       // update atomically to reduce flicker
@@ -238,6 +256,7 @@ export default function CampaignInsight() {
     };
 
     es.addEventListener('contact', (ev: any) => {
+      console.log('[SSE] contact event', ev.data)
       try {
         let payloadRaw = ev.data;
         let payload: any;
@@ -251,6 +270,7 @@ export default function CampaignInsight() {
         const contactIdStr = String(updatedContactId);
 
         setItems((prev) => {
+          console.log('[UI] attempting to patch row for', contactIdStr)
           let matched = false;
           const next = prev.map((row) => {
             const rowContactId = row.contactId != null ? String(row.contactId) : null;
@@ -263,6 +283,43 @@ export default function CampaignInsight() {
               const newLastAttemptAt = payload.lastAttemptAt ?? row.lastAttemptAt;
               const newLastError = payload.lastError ?? row.lastError;
 
+              // Engagement updates from SSE contact payloads
+              let opened = row.opened ?? false;
+              let clicked = row.clicked ?? false;
+              let lastOpenAt = row.lastOpenAt ?? null;
+              let lastClickAt = row.lastClickAt ?? null;
+
+              // Normalize event timestamp fields robustly:
+              // prefer explicit openedAt/clickedAt, then lastOpenAt/lastClickAt, then ts, then fallback to now
+              const normalizedOpenTs =
+                payload.openedAt ??
+                payload.lastOpenAt ??
+                payload.ts ??
+                payload.opened_at ??
+                null;
+              const normalizedClickTs =
+                payload.clickedAt ??
+                payload.lastClickAt ??
+                payload.ts ??
+                payload.clicked_at ??
+                null;
+
+              if (payload.event === 'open' || normalizedOpenTs) {
+                opened = true;
+                lastOpenAt = String(normalizedOpenTs ?? new Date().toISOString());
+              }
+
+              if (payload.event === 'click' || normalizedClickTs) {
+                clicked = true;
+                lastClickAt = String(normalizedClickTs ?? new Date().toISOString());
+              }
+
+              // Some publishers might send boolean flags directly
+              if (typeof payload.opened === 'boolean') opened = payload.opened;
+              if (typeof payload.clicked === 'boolean') clicked = payload.clicked;
+              if (payload.lastOpenAt) lastOpenAt = payload.lastOpenAt;
+              if (payload.lastClickAt) lastClickAt = payload.lastClickAt;
+
               return {
                 ...row,
                 status: newStatus,
@@ -270,14 +327,21 @@ export default function CampaignInsight() {
                 bgAttempts: newBgAttempts,
                 lastAttemptAt: newLastAttemptAt,
                 lastError: newLastError,
+                opened,
+                clicked,
+                lastOpenAt,
+                lastClickAt,
               };
             }
             return row;
           });
 
           if (!matched) {
+            console.log('[UI] contact not in current page, triggering refresh')
             scheduleSilentTableRefresh();
           } else {
+            // refresh counts silently so metrics like unique opens update without flicker
+            console.log('[UI] matched row, updating')
             loadInsight(true);
           }
 
@@ -298,6 +362,7 @@ export default function CampaignInsight() {
     });
 
     es.addEventListener('campaign', (ev: any) => {
+      console.log('[SSE] campaign event', ev.data)
       try {
         const payloadRaw = ev.data;
         let payload: any;
@@ -484,6 +549,10 @@ export default function CampaignInsight() {
   // UI render
   const statusOptions = availableStatuses.length > 0 ? ['all', ...availableStatuses] : ['all', 'pending', 'sending', 'sent', 'failed', 'bounced', 'cancelled'];
 
+  // derive top-links safe list
+  const topLinks = (engagement?.links || []).map(l => ({ url: l.url || '—', clicks: l.clicks }));
+  const maxClicks = topLinks.length > 0 ? Math.max(...topLinks.map(t => t.clicks || 0)) : 1;
+
   return (
     <div style={{ padding: 24, fontFamily: 'sans-serif', maxWidth: 1200 }}>
       <h1>Campaign Insight: {campaign?.name ?? '—'}</h1>
@@ -495,36 +564,122 @@ export default function CampaignInsight() {
       </div>
 
       <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
-        {campaign?.status === 'running' && <button onClick={() => updateCampaign('pause')} disabled={actionInProgress}>Pause</button>}
-        {campaign?.status === 'paused' && <button onClick={() => updateCampaign('resume')} disabled={actionInProgress}>Resume</button>}
-        {['running', 'paused'].includes(campaign?.status ?? '') && <button onClick={() => updateCampaign('cancel')} disabled={actionInProgress} style={{ color: 'red' }}>Cancel</button>}
-        <button onClick={() => updateCampaign('delete')} disabled={actionInProgress} style={{ color: 'red' }}>Delete</button>
-        <div style={{ marginLeft: 'auto' }}>
-          <button onClick={() => { loadInsight(); loadContacts(); }} disabled={refreshing}>Refresh</button>
-        </div>
-      </div>
 
-      <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
         <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Intended</strong></div>
           <div>{totals?.intended ?? '–'}</div>
         </div>
+
         <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Processed</strong></div>
           <div>{totals ? totals.processed : '–'}</div>
         </div>
+
         <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Sent</strong></div>
           <div>{breakdown?.sent ?? '–'}</div>
         </div>
+
         <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 120 }}>
           <div><strong>Failed</strong></div>
           <div>{breakdown?.failed ?? '–'}</div>
         </div>
+
+        {/* Engagement summary */}
+        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 220 }}>
+          <div style={{ fontSize: 12, color: '#555' }}>Opens (unique / total)</div>
+          <div style={{ fontSize: 18 }}>
+            {engagement?.opens ? `${engagement.opens.unique} / ${engagement.opens.total}` : '—'}
+          </div>
+          <div style={{ fontSize: 12, color: '#666' }}>
+            Rate: {engagement?.opens ? `${Math.round(engagement.opens.rate * 1000) / 10}%` : '—'}
+          </div>
+        </div>
+
+        <div style={{ border: '1px solid #ddd', padding: 12, borderRadius: 6, minWidth: 220 }}>
+          <div style={{ fontSize: 12, color: '#555' }}>Clicks (unique / total)</div>
+          <div style={{ fontSize: 18 }}>
+            {engagement?.clicks ? `${engagement.clicks.unique} / ${engagement.clicks.total}` : '—'}
+          </div>
+          <div style={{ fontSize: 12, color: '#666' }}>
+            CTR: {engagement?.clicks ? `${Math.round(engagement.clicks.rate * 1000) / 10}%` : '—'}
+          </div>
+        </div>
+
         <div style={{ marginLeft: 'auto' }}>
           {breakdown && breakdown.failed > 0 && <button onClick={retryAllFailed} disabled={actionInProgress}>Retry all failed</button>}
         </div>
-      </div>  
+      </div>
+
+      {/* Top links heatmap */}
+      <div style={{ marginTop: 12, display: 'flex', gap: 12 }}>
+        <div style={{ flex: 1, border: '1px solid #eee', padding: 12, borderRadius: 6 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>Top Links</div>
+          {topLinks.length === 0 ? <div style={{ color: '#666' }}>No clicks yet</div> :
+            topLinks.map((t, idx) => {
+              const pct = maxClicks > 0 ? Math.round((t.clicks / maxClicks) * 100) : 0;
+              return (
+                <div key={idx} style={{ marginBottom: 8 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
+                    <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 520 }}>{t.url}</div>
+                    <div style={{ marginLeft: 12, color: '#333' }}>{t.clicks}</div>
+                  </div>
+                  <div style={{ height: 8, background: '#f0f0f0', borderRadius: 6, marginTop: 6 }}>
+                    <div style={{ width: `${pct}%`, height: '100%', borderRadius: 6, background: '#4a90e2' }} />
+                  </div>
+                </div>
+              );
+            })
+          }
+        </div>
+
+        {/* Delivery Engine */}
+        <div style={{ width: 420 }}>
+          <div style={{ border: '1px solid #eee', padding: 12, borderRadius: 6 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Delivery Engine</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <div style={{ minWidth: 220 }}>
+                <div style={{ fontSize: 12, color: '#555' }}>Queued (estimate)</div>
+                <div style={{ fontSize: 18 }}>{queuedEstimate ?? '—'}</div>
+              </div>
+
+              <div style={{ minWidth: 220 }}>
+                <div style={{ fontSize: 12, color: '#555' }}>Failure rate</div>
+                <div style={{ fontSize: 18 }}>
+                  {totals && totals.processed > 0 ? `${Math.round(((totals.failed || 0) / Math.max(1, totals.processed)) * 1000) / 10}%` : '—'}
+                </div>
+                <div style={{ fontSize: 11, color: '#666' }}>{`(failed ${totals?.failed ?? 0} / processed ${totals?.processed ?? 0})`}</div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
+              <div>Last reconcile: {lastReconcileAt ?? 'never'}</div>
+              <div>Engine loading: {engineLoading ? 'yes' : 'no'}</div>
+            </div>
+
+            <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+              <button onClick={reconcileNow} disabled={engineLoading || actionInProgress}>Reconcile now</button>
+              <button onClick={forceRequeuePending} disabled={engineLoading || actionInProgress}>Force requeue pending</button>
+              <button onClick={fetchQueueSnapshot} disabled={engineLoading || actionInProgress}>Queue snapshot</button>
+            </div>
+          </div>
+
+          {/* Job / SSE Log */}
+          <div style={{ marginTop: 12 }}>
+            <h4 style={{ marginBottom: 8 }}>Recent job / SSE log (diagnostic)</h4>
+            <div style={{ maxHeight: 240, overflow: 'auto', border: '1px solid #eee', padding: 8, borderRadius: 6, background: '#fafafa' }}>
+              {sseLog.length === 0 ? <div style={{ fontSize: 12, color: '#666' }}>No recent events</div> :
+                sseLog.map((l, idx) => (
+                  <div key={idx} style={{ borderBottom: '1px solid #f0f0f0', padding: '6px 0' }}>
+                    <div style={{ fontSize: 11, color: '#333' }}><strong>{l.type}</strong> • {new Date(l.ts).toLocaleString()}</div>
+                    <pre style={{ margin: '6px 0 0', whiteSpace: 'pre-wrap', fontSize: 12 }}>{typeof l.payload === 'string' ? l.payload : JSON.stringify(l.payload, null, 2)}</pre>
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* Filters */}
       <div style={{ marginTop: 16, display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -543,7 +698,7 @@ export default function CampaignInsight() {
         </label>
 
         <div style={{ marginLeft: 'auto' }}>
-          <button onClick={() => { loadContacts(); loadInsight(); }} disabled={tableLoading || refreshing}>Refresh table</button>
+          <button onClick={() => { loadContacts(); loadInsight(); }} disabled={tableLoading || refreshing}>Refresh</button>
         </div>
       </div>
 
@@ -574,7 +729,23 @@ export default function CampaignInsight() {
 
                   return (
                     <tr key={it.id} style={{ borderBottom: '1px solid #eee' }}>
-                      <td style={{ padding: 8 }}>{it.email ?? it.contactId ?? '—'}</td>
+                      <td style={{ padding: 8 }}>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <div style={{ minWidth: 320, overflow: 'hidden' }}>
+                            <div style={{ fontSize: 14, fontWeight: 500 }}>{it.email ?? it.contactId ?? '—'}</div>
+                            <div style={{ fontSize: 12, color: '#666' }}>{it.contactId ?? ''}</div>
+                          </div>
+
+                          <div style={{ display: 'flex', gap: 6 }}>
+                            {it.opened ? (
+                              <div title={it.lastOpenAt ? `Opened: ${new Date(it.lastOpenAt).toLocaleString()}` : 'Opened'} style={{ background: '#e6ffed', color: '#0f8a3f', padding: '4px 8px', borderRadius: 999, fontSize: 12 }}>Opened</div>
+                            ) : null}
+                            {it.clicked ? (
+                              <div title={it.lastClickAt ? `Clicked: ${new Date(it.lastClickAt).toLocaleString()}` : 'Clicked'} style={{ background: '#eef6ff', color: '#0366d6', padding: '4px 8px', borderRadius: 999, fontSize: 12 }}>Clicked</div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </td>
                       <td style={{ padding: 8 }}>{it.status ?? '—'}</td>
                       <td style={{ padding: 8 }}>
                         {it.attempts} / {maxAttempts}
@@ -614,57 +785,6 @@ export default function CampaignInsight() {
           <button onClick={() => updateQuery({ page: Math.min(pages, pageQuery + 1) })} disabled={pageQuery >= pages}>Next</button>
         </div>
       </div>
-      
-      {/* Delivery Engine / Job Insights */}
-      <div style={{ marginTop: 18, border: '1px solid #ddd', borderRadius: 6, padding: 12 }}>
-        <h3>Delivery Engine</h3>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-          <div style={{ minWidth: 220 }}>
-            <div style={{ fontSize: 12, color: '#555' }}>Queued (estimate)</div>
-            <div style={{ fontSize: 18 }}>{queuedEstimate ?? '—'}</div>
-          </div>
-
-          <div style={{ minWidth: 220 }}>
-            <div style={{ fontSize: 12, color: '#555' }}>Failure rate</div>
-            <div style={{ fontSize: 18 }}>
-              {totals && totals.processed > 0 ? `${Math.round(((totals.failed || 0) / Math.max(1, totals.processed)) * 1000) / 10}%` : '—'}
-            </div>
-            <div style={{ fontSize: 11, color: '#666' }}>{`(failed ${totals?.failed ?? 0} / processed ${totals?.processed ?? 0})`}</div>
-          </div>
-
-          <div style={{ minWidth: 220 }}>
-            <div style={{ fontSize: 12, color: '#555' }}>Recent failures</div>
-            <div style={{ fontSize: 18 }}>{recentFailures?.length ?? 0}</div>
-          </div>
-
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-            <button onClick={reconcileNow} disabled={engineLoading || actionInProgress}>Reconcile now</button>
-            <button onClick={forceRequeuePending} disabled={engineLoading || actionInProgress}>Force requeue pending</button>
-            <button onClick={fetchQueueSnapshot} disabled={engineLoading || actionInProgress}>Queue snapshot</button>
-          </div>
-        </div>
-
-        <div style={{ marginTop: 8, fontSize: 12, color: '#666' }}>
-          <div>Last reconcile: {lastReconcileAt ?? 'never'}</div>
-          <div>Engine loading: {engineLoading ? 'yes' : 'no'}</div>
-        </div>
-
-        {/* Job / SSE Log */}
-        <div style={{ marginTop: 12 }}>
-          <h4 style={{ marginBottom: 8 }}>Recent job / SSE log (diagnostic)</h4>
-          <div style={{ maxHeight: 240, overflow: 'auto', border: '1px solid #eee', padding: 8, borderRadius: 6, background: '#fafafa' }}>
-            {sseLog.length === 0 ? <div style={{ fontSize: 12, color: '#666' }}>No recent events</div> :
-              sseLog.map((l, idx) => (
-                <div key={idx} style={{ borderBottom: '1px solid #f0f0f0', padding: '6px 0' }}>
-                  <div style={{ fontSize: 11, color: '#333' }}><strong>{l.type}</strong> • {new Date(l.ts).toLocaleString()}</div>
-                  <pre style={{ margin: '6px 0 0', whiteSpace: 'pre-wrap', fontSize: 12 }}>{typeof l.payload === 'string' ? l.payload : JSON.stringify(l.payload, null, 2)}</pre>
-                </div>
-              ))
-            }
-          </div>
-        </div>
-      </div>
-
     </div>
   );
 }
