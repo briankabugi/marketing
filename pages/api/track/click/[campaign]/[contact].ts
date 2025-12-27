@@ -21,6 +21,11 @@ function safeLog(...args: any[]) {
  * Try multiple ways to decode the `u` parameter to the real destination URL.
  * We encoded with: encodeURIComponent(Buffer.from(url).toString('base64'))
  * But email clients / proxies may double-encode, rewrite, or pass the raw URL.
+ *
+ * Improvements:
+ *  - accept URL-safe base64 (- and _), convert to standard base64
+ *  - tolerate double-encoding and stray spaces/+
+ *  - accept bare "www.example.com" by prepending "http://"
  */
 function decodeDestination(uRaw?: string | string[] | undefined): string | null {
   if (!uRaw) return null;
@@ -42,27 +47,41 @@ function decodeDestination(uRaw?: string | string[] | undefined): string | null 
   // Also unescape plus/space issues
   attempts.push(u.replace(/\s/g, ''));
   attempts.push(u.replace(/\+/g, ' '));
+  attempts.push(u.replace(/\s/g, '+'));
 
   for (const a of attempts) {
     if (!a) continue;
     try {
       // Clean possible double-encoding (strip surrounding quotes)
       const cleaned = String(a).trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
-      // if looks like base64, try decode
-      // base64 should only contain A-Za-z0-9+/= but URL-safe variants may appear
-      const candidate = cleaned.replace(/ /g, '+'); // sometimes spaces replace +
+      // Normalize URL-safe base64 to standard
+      const normalized = cleaned.replace(/-/g, '+').replace(/_/g, '/');
+      // Padding (base64 requires padding)
+      const pad = normalized.length % 4;
+      const candidate = normalized + (pad === 0 ? '' : '='.repeat(4 - pad));
+
       const buf = Buffer.from(candidate, 'base64');
-      const str = buf.toString('utf8');
+      const str = buf.toString('utf8').trim();
       if (str && /^https?:\/\//i.test(str)) return str;
+
+      // also accept bare www (no scheme) from decoded string
+      if (str && /^www\./i.test(str)) return `http://${str}`;
     } catch (e) {
       // try next
     }
   }
 
-  // Last-chance: maybe it's plain URL but percent-encoded differently
+  // Last-chance: maybe it's plain URL but percent-encoded differently or missing scheme
   try {
-    const asDecoded = decodeURIComponent(String(u));
+    const asDecoded = decodeURIComponent(String(u)).trim();
     if (/^https?:\/\//i.test(asDecoded)) return asDecoded;
+    if (/^www\./i.test(asDecoded)) return `http://${asDecoded}`;
+  } catch (e) {}
+
+  // Also if the raw value is a bare www host, accept it
+  try {
+    const rawClean = String(u).trim();
+    if (/^www\./i.test(rawClean)) return `http://${rawClean}`;
   } catch (e) {}
 
   return null;
@@ -94,7 +113,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const dest = decodeDestination(uRaw) ?? (() => {
       // fallback: maybe u contains a raw url despite no base64
       const fallback = Array.isArray(uRaw) ? uRaw[0] : uRaw;
-      return (typeof fallback === 'string' && /^https?:\/\//i.test(fallback)) ? fallback : null;
+      if (typeof fallback === 'string') {
+        const f = fallback.trim();
+        if (/^https?:\/\//i.test(f)) return f;
+        if (/^www\./i.test(f)) return `http://${f}`;
+      }
+      return null;
     })();
 
     if (!dest) {
@@ -127,6 +151,91 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0] || req.socket.remoteAddress || null;
     const now = new Date();
 
+    // --- BACKFILL OPEN if missing (click implies open) ---
+    try {
+      // Check ledger for openedAt directly (more efficient than scanning events)
+      let ledgerRowForOpen: any = null;
+
+      if (campaignIdObj && contactIdObj) {
+        ledgerRowForOpen = await db.collection('campaign_contacts').findOne(
+          { campaignId: campaignIdObj, contactId: contactIdObj },
+          { projection: { openedAt: 1 } }
+        );
+      }
+      if ((!ledgerRowForOpen) && campaignIdObj) {
+        ledgerRowForOpen = await db.collection('campaign_contacts').findOne(
+          { campaignId: campaignIdObj, contactId: contactIdStr },
+          { projection: { openedAt: 1 } }
+        );
+      }
+      if ((!ledgerRowForOpen)) {
+        ledgerRowForOpen = await db.collection('campaign_contacts').findOne(
+          { campaignId: campaignIdStr, contactId: contactIdStr },
+          { projection: { openedAt: 1 } }
+        );
+      }
+
+      const alreadyOpened = !!(ledgerRowForOpen && ledgerRowForOpen.openedAt);
+
+      if (!alreadyOpened) {
+        // Insert "open" event (best-effort)
+        try {
+          const evOpen: any = {
+            campaignId: campaignIdObj ?? campaignIdStr,
+            contactId: contactIdObj ?? contactIdStr,
+            type: 'open',
+            ua,
+            ip,
+            createdAt: now,
+            trace,
+            via: 'click-backfill',
+          };
+          const rOpen = await db.collection('campaign_events').insertOne(evOpen);
+          safeLog('[CLICK] backfilled open ->', rOpen.insertedId?.toString?.());
+
+          // Update campaign_contacts: set openedAt and bump lastActivityAt (use $max)
+          try {
+            const updateDoc: any = {
+              $set: { openedAt: now },
+              $max: { lastActivityAt: now },
+            };
+
+            let resUpdate = null;
+            if (campaignIdObj && contactIdObj) {
+              resUpdate = await db.collection('campaign_contacts').updateOne({ campaignId: campaignIdObj, contactId: contactIdObj }, updateDoc);
+            }
+            if ((!resUpdate || (resUpdate.matchedCount ?? 0) === 0) && campaignIdObj) {
+              resUpdate = await db.collection('campaign_contacts').updateOne({ campaignId: campaignIdObj, contactId: contactIdStr }, updateDoc);
+            }
+            if ((!resUpdate || (resUpdate.matchedCount ?? 0) === 0)) {
+              resUpdate = await db.collection('campaign_contacts').updateOne({ campaignId: campaignIdStr, contactId: contactIdStr }, updateDoc);
+            }
+            if (!resUpdate || (resUpdate.matchedCount ?? 0) === 0) {
+              safeLog('[CLICK] open backfill: campaign_contacts no match for', { campaignIdStr, contactIdStr });
+            }
+          } catch (e) {
+            safeLog('[CLICK] open backfill: campaign_contacts update failed', e);
+          }
+
+          // Redis counters & publish open event for UI
+          try {
+            await redis.hincrby(`campaign:${campaignIdStr}:metrics`, 'opens', 1);
+            const payloadOpen = { campaignId: campaignIdStr, contactId: contactIdStr, event: 'open', openedAt: now.toISOString(), trace, ts: now.toISOString(), via: 'click-backfill' };
+            await redis.publish(`campaign:${campaignIdStr}:contact_update`, JSON.stringify(payloadOpen));
+            safeLog('[CLICK] published backfill open contact_update', payloadOpen);
+          } catch (e) {
+            safeLog('[CLICK] open backfill: redis publish failed', e);
+          }
+        } catch (e) {
+          safeLog('[CLICK] failed to insert backfill open event', e);
+        }
+      }
+    } catch (e) {
+      safeLog('[CLICK] open backfill check failed', e);
+      // continue anyway
+    }
+
+    // --- Insert click event ---
     try {
       const ev: any = {
         campaignId: campaignIdObj ?? campaignIdStr,
@@ -144,7 +253,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       safeLog('[CLICK] failed inserting campaign_events', e);
     }
 
-    // Update campaign_contacts: lastClickAt and lastActivityAt (use $max to avoid path conflict)
+    // Update campaign_contacts: lastClickAt and lastActivityAt (use $max)
     try {
       const updateDoc: any = { $set: { lastClickAt: now }, $max: { lastActivityAt: now } };
 
@@ -166,7 +275,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       safeLog('[CLICK] campaign_contacts update failed', e);
     }
 
-    // Redis counters and publish
+    // Redis counters and publish click update
     try {
       await redis.hincrby(`campaign:${campaignIdStr}:metrics`, 'clicks', 1);
       const payload = { campaignId: campaignIdStr, contactId: contactIdStr, event: 'click', url: dest, trace, ts: now.toISOString() };

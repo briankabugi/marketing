@@ -1,4 +1,3 @@
-// workers/campaignWorker.ts
 import 'dotenv/config'; // critical
 import { Worker, Queue, Job } from 'bullmq';
 import { redis } from '../lib/redis';
@@ -369,11 +368,71 @@ startReconciler().catch((e) => console.warn('startReconciler error', e));
 // ---------------------
 
 /**
+ * Converts plain-text URLs (including www.x and naked domains like example.com) into anchors.
+ * - Does NOT touch existing <a ...> tags.
+ * - Generated anchors include target="_blank" rel="noopener noreferrer".
+ *
+ * Examples:
+ *   https://example.com -> <a href="https://example.com" target="_blank" rel="noopener noreferrer">https://example.com</a>
+ *   www.example.com -> <a href="http://www.example.com" ...>www.example.com</a>
+ *   example.com/path -> <a href="http://example.com/path" ...>example.com/path</a>
+ */
+function autoLinkPlainTextUrls(html: string) {
+  if (!html || typeof html !== 'string') return html;
+
+  // Don't try to auto-link inside existing anchor tags. We'll do a safe replace approach:
+  // Split by <a ...>...</a> boundaries to avoid double-wrapping.
+  const parts: string[] = [];
+  let lastIndex = 0;
+  const anchorRegex = /<a\b[^>]*>[\s\S]*?<\/a>/gi;
+  let match: RegExpExecArray | null;
+
+  let cursor = 0;
+  while ((match = anchorRegex.exec(html)) !== null) {
+    const idx = match.index;
+    const before = html.slice(cursor, idx);
+    parts.push(linkifySegment(before));
+    parts.push(match[0]); // keep anchor as-is
+    cursor = idx + match[0].length;
+  }
+  if (cursor < html.length) {
+    parts.push(linkifySegment(html.slice(cursor)));
+  }
+
+  return parts.join('');
+
+  function linkifySegment(seg: string) {
+    if (!seg) return seg;
+
+    // Regex to match URLs and naked domains, with optional trailing path/query.
+    // This is intentionally permissive to catch many common patterns.
+    const urlLike = /(^|[\s>])((?:(?:https?:\/\/)|(?:\/\/))[\w\-.~:\/?#[\]@!$&'()*+,;=%]+|(?:(?:www\.)[a-z0-9\-.]+\.[a-z]{2,})(?:\/[^\s<]*)?|(?:[a-z0-9\-.]+\.[a-z]{2,})(?:\/[^\s<]*)?)/gi;
+
+    return seg.replace(urlLike, (m: string, prefix: string, captured: string) => {
+      let url = captured;
+      // If starts with '//' (protocol-relative) leave as-is (prefix with https:)
+      if (/^\/\//.test(url)) {
+        url = 'https:' + url;
+      } else if (!/^https?:\/\//i.test(url)) {
+        // If looks like www. or domain.tld, prepend http:// to href but keep display text as original
+        url = 'http://' + url;
+      }
+      // sanitize display text (original captured)
+      const display = captured;
+      // add target and rel for safety and to reduce certain client heuristics
+      return `${prefix}<a href="${url}" target="_blank" rel="noopener noreferrer">${display}</a>`;
+    });
+  }
+}
+
+/**
  * Safely rewrites all http(s) href attributes to point to our click-tracking endpoint.
  * Leaves mailto:, tel:, and fragment links untouched.
  *
  * New path format:
- *   `${PUBLIC_BASE_URL}/api/track/click/{campaignId}/{contactId}?u={base64_destination}`
+ *   `${PUBLIC_BASE_URL}/api/track/click/{campaignId}/{contactId}?u={base64_destination}&o=1`
+ *
+ * NOTE: this function preserves the quote style of the original attribute.
  */
 function rewriteLinksForTracking(html: string, campaignId: string, contactId: string) {
   if (!html || !PUBLIC_BASE_URL) return html;
@@ -390,13 +449,24 @@ function rewriteLinksForTracking(html: string, campaignId: string, contactId: st
     if (/^mailto:/i.test(trimmed)) return match;
     if (/^tel:/i.test(trimmed)) return match;
     if (/^#/i.test(trimmed)) return match;
-    if (!/^https?:\/\//i.test(trimmed)) return match;
 
+    // If it's protocol-relative (//example.com) convert to https:
+    let normalized = trimmed;
+    if (/^\/\//.test(trimmed)) {
+      normalized = 'https:' + trimmed;
+    }
+
+    // If it lacks a scheme but looks like domain (www. or contains a dot + tld),
+    // prepend http:// for encoding (we keep display text intact earlier).
+    if (!/^https?:\/\//i.test(normalized) && /^[\w.-]+\.[a-z]{2,}/i.test(normalized)) {
+      normalized = 'http://' + normalized;
+    }
+
+    // Preserve the original quote style when replacing
     try {
-      // Encode destination as base64 to preserve query strings and unsafe chars
-      const b64 = Buffer.from(trimmed, 'utf8').toString('base64');
-      const clickUrl = `${PUBLIC_BASE_URL}/api/track/click/${encodeURIComponent(campaignId)}/${encodeURIComponent(contactId)}?u=${encodeURIComponent(b64)}`;
-      // preserve original quote style
+      const b64 = Buffer.from(normalized, 'utf8').toString('base64');
+      // include an 'o=1' param as a hint to click endpoint to mark open on click (harmless if ignored)
+      const clickUrl = `${PUBLIC_BASE_URL}/api/track/click/${encodeURIComponent(campaignId)}/${encodeURIComponent(contactId)}?u=${encodeURIComponent(b64)}&o=1`;
       if (singleQuoted !== undefined) {
         return `href='${clickUrl}'`;
       } else if (doubleQuoted !== undefined) {
@@ -521,6 +591,31 @@ async function buildAttachments(definitionPart: any) {
   }
 
   return attachmentsOut;
+}
+
+// ---------------------
+// Utility: create plain-text fallback from HTML
+// ---------------------
+function htmlToPlainText(html: string) {
+  if (!html) return '';
+  // Replace anchor tags with "text (url)" form, keep other text.
+  // First handle <a ...>text</a>
+  let text = html.replace(/<a\b[^>]*href=(?:'([^']*)'|"([^"]*)"|([^>\s]+))[^>]*>([\s\S]*?)<\/a>/gi, (_m, s1, s2, s3, inner) => {
+    const href = (s1 || s2 || s3 || '').trim();
+    const cleanedHref = href.replace(/^['"]|['"]$/g, '');
+    const display = inner ? inner.replace(/<[^>]+>/g, '').trim() : cleanedHref;
+    // Put dest in parentheses to make it clear in text mode
+    return `${display} (${cleanedHref})`;
+  });
+
+  // Strip remaining tags
+  text = text.replace(/<\/?[^>]+(>|$)/g, '');
+  // Unescape common HTML entities (basic)
+  text = text.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+
+  // Collapse whitespace
+  text = text.replace(/\s{2,}/g, ' ').trim();
+  return text;
 }
 
 // ---------------------
@@ -655,11 +750,17 @@ const worker = new Worker(
     const subject = isInitial ? definition.initial?.subject : (step?.subject || definition.initial?.subject);
     const body = isInitial ? definition.initial?.body : (step?.body || definition.initial?.body);
 
-    // Prepare tracked HTML (rewrite links + inject pixel) and attachments
+    // Prepare tracked HTML (auto-link plain URLs -> rewrite links -> inject pixel) and attachments
     let trackedHtml = body;
     try {
       if (typeof trackedHtml === 'string' && PUBLIC_BASE_URL) {
+        // 1) convert bare URLs to anchors (handles www. and naked domains)
+        trackedHtml = autoLinkPlainTextUrls(trackedHtml);
+
+        // 2) rewrite hrefs to tracking endpoint (normalizes missing scheme)
         trackedHtml = rewriteLinksForTracking(trackedHtml, campaignId, contactId);
+
+        // 3) inject open pixel
         trackedHtml = injectOpenPixel(trackedHtml, campaignId, contactId);
       }
     } catch (e) {
@@ -712,6 +813,26 @@ const worker = new Worker(
         subject,
         html: trackedHtml,
       };
+
+      // Plain text fallback for deliverability
+      try {
+        mailOptions.text = htmlToPlainText(trackedHtml || body || '');
+      } catch (e) {
+        // ignore
+      }
+
+      // // Add List-Unsubscribe header when public base url is set (helps deliverability)
+      // if (PUBLIC_BASE_URL) {
+      //   try {
+      //     const unsubscribeUrl = `${PUBLIC_BASE_URL}/unsubscribe?c=${encodeURIComponent(campaignId)}&k=${encodeURIComponent(contactId)}`;
+      //     mailOptions.headers = {
+      //       ...(mailOptions.headers || {}),
+      //       'List-Unsubscribe': `<${unsubscribeUrl}>`,
+      //     };
+      //   } catch (e) {
+      //     // ignore header errors
+      //   }
+      // }
 
       if (attachments && attachments.length) {
         mailOptions.attachments = attachments.map(a => {

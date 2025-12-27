@@ -72,46 +72,112 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
-    // Aggregate campaign_events for these contactIds (opens & clicks)
-    let openLookup: Record<string, string | null> = {};
-    let clickLookup: Record<string, string | null> = {};
+    // -------------------------
+    // Prefer ledger fields (campaign_contacts) for engagement
+    // Only aggregate campaign_events for those contactIds missing ledger fields.
+    // -------------------------
 
-    if (contactIdValues.length > 0) {
-      const contactMatchClauses: any[] = [];
-      if (contactObjIds.length) contactMatchClauses.push({ contactId: { $in: contactObjIds } });
-      if (stringContactIds.length) contactMatchClauses.push({ contactId: { $in: stringContactIds } });
+    // Initialize lookups from ledger rows when possible
+    const openLookup: Record<string, string | null> = {};
+    const clickLookup: Record<string, string | null> = {};
+
+    // Keep a list of contact keys that need event-aggregation fallback
+    const needOpenAggKeys: string[] = [];
+    const needClickAggKeys: string[] = [];
+
+    for (const r of rows) {
+      const cidKey = r.contactId && r.contactId.toString ? r.contactId.toString() : String(r.contactId ?? '');
+      // ledger might already have openedAt/lastClickAt (worker & tracking endpoints update these)
+      openLookup[cidKey] = r.openedAt ? (new Date(r.openedAt)).toISOString() : null;
+      clickLookup[cidKey] = r.lastClickAt ? (new Date(r.lastClickAt)).toISOString() : null;
+
+      if (!openLookup[cidKey]) needOpenAggKeys.push(cidKey);
+      if (!clickLookup[cidKey]) needClickAggKeys.push(cidKey);
+    }
+
+    // If some rows are missing ledger open/click info, aggregate events only for those keys
+    if (contactIdValues.length > 0 && (needOpenAggKeys.length > 0 || needClickAggKeys.length > 0)) {
+      // Build mapping back to the two forms (ObjectId vs string) for only the missing ones
+      const missingObjIdsForOpen: ObjectId[] = [];
+      const missingStrIdsForOpen: string[] = [];
+
+      const missingObjIdsForClick: ObjectId[] = [];
+      const missingStrIdsForClick: string[] = [];
+
+      // Create reverse map from key -> original value to decide if that key corresponds to an ObjectId or string
+      const keyToOriginal: Record<string, any> = {};
+      for (const v of contactIdValues) {
+        const key = (v && v.toString ? v.toString() : String(v));
+        if (!(key in keyToOriginal)) keyToOriginal[key] = v;
+      }
+
+      for (const key of needOpenAggKeys) {
+        const orig = keyToOriginal[key];
+        if (!orig) continue;
+        if (typeof orig === 'object' && orig instanceof ObjectId) missingObjIdsForOpen.push(orig);
+        else if (typeof orig === 'string' && /^[0-9a-fA-F]{24}$/.test(orig)) {
+          try { missingObjIdsForOpen.push(new ObjectId(orig)); } catch { missingStrIdsForOpen.push(orig); }
+        } else {
+          missingStrIdsForOpen.push(String(orig));
+        }
+      }
+
+      for (const key of needClickAggKeys) {
+        const orig = keyToOriginal[key];
+        if (!orig) continue;
+        if (typeof orig === 'object' && orig instanceof ObjectId) missingObjIdsForClick.push(orig);
+        else if (typeof orig === 'string' && /^[0-9a-fA-F]{24}$/.test(orig)) {
+          try { missingObjIdsForClick.push(new ObjectId(orig)); } catch { missingStrIdsForClick.push(orig); }
+        } else {
+          missingStrIdsForClick.push(String(orig));
+        }
+      }
 
       // Build campaignId match that copes with ObjectId or string
       const campaignIdMatch: any = campaignIdObj ? { $or: [{ campaignId: campaignIdObj }, { campaignId: campaignIdStr }] } : { campaignId: campaignIdStr };
 
+      // Aggregate opens for missing keys
       try {
-        const openAgg = await db.collection('campaign_events').aggregate([
-          { $match: { $and: [ campaignIdMatch, { type: 'open' }, { $or: contactMatchClauses } ] } },
-          { $group: { _id: '$contactId', lastOpenAt: { $max: '$createdAt' }, opens: { $sum: 1 } } },
-        ]).toArray();
+        const contactMatchClauses: any[] = [];
+        if (missingObjIdsForOpen.length) contactMatchClauses.push({ contactId: { $in: missingObjIdsForOpen } });
+        if (missingStrIdsForOpen.length) contactMatchClauses.push({ contactId: { $in: missingStrIdsForOpen } });
 
-        for (const o of openAgg) {
-          const key = o._id && o._id.toString ? o._id.toString() : String(o._id);
-          openLookup[key] = o.lastOpenAt ? (new Date(o.lastOpenAt)).toISOString() : null;
+        if (contactMatchClauses.length > 0) {
+          const openAgg = await db.collection('campaign_events').aggregate([
+            { $match: { $and: [ campaignIdMatch, { type: 'open' }, { $or: contactMatchClauses } ] } },
+            { $group: { _id: '$contactId', lastOpenAt: { $max: '$createdAt' }, opens: { $sum: 1 } } },
+          ]).toArray();
+
+          for (const o of openAgg) {
+            const key = o._1?._toString ? o._1.toString() : (o._id && o._id.toString ? o._id.toString() : String(o._id));
+            // Some drivers may return _id as an ObjectId or primitive; normalize
+            const k = (o._id && o._id.toString) ? o._id.toString() : String(o._id);
+            openLookup[k] = o.lastOpenAt ? (new Date(o.lastOpenAt)).toISOString() : null;
+          }
         }
       } catch (e) {
-        console.warn('Failed to aggregate opens for contacts page', e);
+        console.warn('Failed to aggregate opens for contacts page (fallback)', e);
       }
 
+      // Aggregate clicks for missing keys
       try {
-        const campaignIdMatch2: any = campaignIdObj ? { $or: [{ campaignId: campaignIdObj }, { campaignId: campaignIdStr }] } : { campaignId: campaignIdStr };
+        const contactMatchClauses2: any[] = [];
+        if (missingObjIdsForClick.length) contactMatchClauses2.push({ contactId: { $in: missingObjIdsForClick } });
+        if (missingStrIdsForClick.length) contactMatchClauses2.push({ contactId: { $in: missingStrIdsForClick } });
 
-        const clickAgg = await db.collection('campaign_events').aggregate([
-          { $match: { $and: [ campaignIdMatch2, { type: 'click' }, { $or: contactMatchClauses } ] } },
-          { $group: { _id: '$contactId', lastClickAt: { $max: '$createdAt' }, clicks: { $sum: 1 } } },
-        ]).toArray();
+        if (contactMatchClauses2.length > 0) {
+          const clickAgg = await db.collection('campaign_events').aggregate([
+            { $match: { $and: [ campaignIdMatch, { type: 'click' }, { $or: contactMatchClauses2 } ] } },
+            { $group: { _id: '$contactId', lastClickAt: { $max: '$createdAt' }, clicks: { $sum: 1 } } },
+          ]).toArray();
 
-        for (const c of clickAgg) {
-          const key = c._id && c._id.toString ? c._id.toString() : String(c._id);
-          clickLookup[key] = c.lastClickAt ? (new Date(c.lastClickAt)).toISOString() : null;
+          for (const c of clickAgg) {
+            const k = (c._id && c._id.toString) ? c._id.toString() : String(c._id);
+            clickLookup[k] = c.lastClickAt ? (new Date(c.lastClickAt)).toISOString() : null;
+          }
         }
       } catch (e) {
-        console.warn('Failed to aggregate clicks for contacts page', e);
+        console.warn('Failed to aggregate clicks for contacts page (fallback)', e);
       }
     }
 
