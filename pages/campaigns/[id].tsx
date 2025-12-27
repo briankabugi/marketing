@@ -17,11 +17,6 @@ type ContactRow = {
   clicked?: boolean;
   lastOpenAt?: string | null;
   lastClickAt?: string | null;
-  // replies
-  replied?: boolean;
-  lastReplyAt?: string | null;
-  lastReplySnippet?: string | null;
-  repliesCount?: number;
   // runtime SSE hints (may be present from SSE payloads)
   followupSkipped?: boolean;
   skippedReason?: string | null;
@@ -87,32 +82,6 @@ type InsightPayload = {
     clicks?: { total: number; unique: number; rate: number };
     links?: Array<{ url?: string; clicks: number }>;
   };
-  replies?: {
-    total?: number;
-    uniqueContacts?: number;
-  };
-};
-
-type ReplyDoc = {
-  _id?: string;
-  fingerprint?: string;
-  campaignId?: string;
-  contactId?: string;
-  from?: string;
-  to?: string;
-  subject?: string;
-  text?: string | null;
-  html?: string | null;
-  messageId?: string | null;
-  receivedAt?: string | Date;
-  source?: string;
-  attachments?: Array<{
-    filename?: string;
-    contentType?: string | null;
-    size?: number;
-    sha256?: string;
-    content?: string | null;
-  }>;
 };
 
 export default function CampaignInsight() {
@@ -127,7 +96,6 @@ export default function CampaignInsight() {
   const [maxAttempts, setMaxAttempts] = React.useState<number>(3);
 
   const [engagement, setEngagement] = React.useState<InsightPayload['engagement'] | null>(null);
-  const [repliesSummary, setRepliesSummary] = React.useState<{ total?: number; uniqueContacts?: number } | null>(null);
 
   const [items, setItems] = React.useState<ContactRow[]>([]);
   const [total, setTotal] = React.useState<number>(0);
@@ -136,12 +104,6 @@ export default function CampaignInsight() {
   const [availableStatuses, setAvailableStatuses] = React.useState<string[]>([]);
   const [actionInProgress, setActionInProgress] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
-
-  // Replies modal state
-  const [repliesModalOpen, setRepliesModalOpen] = React.useState(false);
-  const [repliesModalContact, setRepliesModalContact] = React.useState<{ contactId: string | null; email: string | null } | null>(null);
-  const [repliesForContact, setRepliesForContact] = React.useState<ReplyDoc[]>([]);
-  const [loadingReplies, setLoadingReplies] = React.useState(false);
 
   // engine / job UI state
   const [sseLog, setSseLog] = React.useState<any[]>([]);
@@ -169,6 +131,9 @@ export default function CampaignInsight() {
   const statusQuery = React.useMemo(() => (typeof query.status === 'string' ? query.status : 'all') || 'all', [router.query]);
   const pageQuery = Math.max(1, Number(query.page ? query.page : 1));
   const pageSizeQuery = Math.max(1, Number(query.pageSize ? query.pageSize : 25));
+
+  // New UI state: tab toggle ('all' or 'held')
+  const [tab, setTab] = React.useState<'all' | 'held'>('all');
 
   // ----------------------
   // Helpers
@@ -290,20 +255,13 @@ export default function CampaignInsight() {
 
     // Determine skip reason: prefer explicit ledger / API fields
     let skipReason: string | null = null;
-    if (it.followUpStatus === 'skipped' && it.lastFollowupSkippedReason) {
-      skipReason = it.lastFollowupSkippedReason;
+    if (it.followUpStatus === 'skipped' && (it as any).lastFollowupSkippedReason) {
+      skipReason = (it as any).lastFollowupSkippedReason;
     } else if (ledgerPlan) {
       const skipped = ledgerPlan[nextIndex] && (ledgerPlan[nextIndex].status === 'skipped' || ledgerPlan[nextIndex].skippedAt);
       if (skipped) {
         skipReason = ledgerPlan[nextIndex].skippedReason ?? 'skipped';
       }
-    }
-
-    // Also account for reply-based rules (no_reply/replied) with quick inference if possible
-    if (!skipReason && ruleType === 'no_reply' && it.replied) {
-      skipReason = 'replied';
-    } else if (!skipReason && ruleType === 'replied' && !it.replied) {
-      skipReason = 'requires-reply';
     }
 
     // Consider SSE-provided hint
@@ -368,7 +326,6 @@ export default function CampaignInsight() {
       setRecentFailures(body.recentFailures || []);
       setMaxAttempts(body.maxAttempts ?? 3);
       setEngagement(body.engagement ?? null);
-      setRepliesSummary(body.replies ?? null);
 
       // set followups if present
       setFollowUps(body.campaign?.followUps ?? []);
@@ -418,7 +375,6 @@ export default function CampaignInsight() {
 
       // ensure attempts/bgAttempts are normalized and include new step-scoped fields
       const normalizedItems = (body.items || []).map((it: any) => {
-        const repliedFromApi = !!(it.replied || it.repliesCount || it.lastReplyAt);
         return {
           id: it.id,
           contactId: it.contactId ?? null,
@@ -433,10 +389,6 @@ export default function CampaignInsight() {
           clicked: !!it.clicked,
           lastOpenAt: it.lastOpenAt ?? null,
           lastClickAt: it.lastClickAt ?? null,
-          replied: repliedFromApi,
-          lastReplyAt: it.lastReplyAt ?? null,
-          lastReplySnippet: it.lastReplySnippet ?? null,
-          repliesCount: typeof it.repliesCount === 'number' ? it.repliesCount : (repliedFromApi ? 1 : 0),
           followupSkipped: !!it.followupSkipped,
           skippedReason: it.skippedReason ?? null,
           skippedAt: it.skippedAt ?? null,
@@ -558,18 +510,12 @@ export default function CampaignInsight() {
               let clicked = row.clicked ?? false;
               let lastOpenAt = row.lastOpenAt ?? null;
               let lastClickAt = row.lastClickAt ?? null;
-              let replied = row.replied ?? false;
-              let lastReplyAt = row.lastReplyAt ?? null;
-              let lastReplySnippet = row.lastReplySnippet ?? null;
-              let repliesCount = row.repliesCount ?? 0;
 
               // Normalize event timestamp fields robustly:
               const normalizedOpenTs =
                 payload.openedAt ?? payload.lastOpenAt ?? payload.ts ?? payload.opened_at ?? null;
               const normalizedClickTs =
                 payload.clickedAt ?? payload.lastClickAt ?? payload.ts ?? payload.clicked_at ?? null;
-              const normalizedReplyTs =
-                payload.repliedAt ?? payload.replyAt ?? payload.ts ?? null;
 
               if (payload.event === 'open' || normalizedOpenTs) {
                 opened = true;
@@ -578,13 +524,6 @@ export default function CampaignInsight() {
               if (payload.event === 'click' || normalizedClickTs) {
                 clicked = true;
                 lastClickAt = String(normalizedClickTs ?? new Date().toISOString());
-              }
-              if (payload.event === 'reply' || normalizedReplyTs || payload.repliesCount) {
-                replied = true;
-                lastReplyAt = String(normalizedReplyTs ?? payload.lastReplyAt ?? new Date().toISOString());
-                if (payload.snippet || payload.lastReplySnippet) lastReplySnippet = payload.snippet ?? payload.lastReplySnippet;
-                if (typeof payload.repliesCount === 'number') repliesCount = payload.repliesCount;
-                else repliesCount = Math.max(1, repliesCount);
               }
 
               // followup skip hints from server
@@ -608,12 +547,8 @@ export default function CampaignInsight() {
               // Some publishers might send boolean flags directly
               if (typeof payload.opened === 'boolean') opened = payload.opened;
               if (typeof payload.clicked === 'boolean') clicked = payload.clicked;
-              if (typeof payload.replied === 'boolean') replied = payload.replied;
               if (payload.lastOpenAt) lastOpenAt = payload.lastOpenAt;
               if (payload.lastClickAt) lastClickAt = payload.lastClickAt;
-              if (payload.lastReplyAt) lastReplyAt = payload.lastReplyAt;
-              if (payload.lastReplySnippet) lastReplySnippet = payload.lastReplySnippet;
-              if (typeof payload.repliesCount === 'number') repliesCount = payload.repliesCount;
 
               return {
                 ...row,
@@ -626,10 +561,6 @@ export default function CampaignInsight() {
                 clicked,
                 lastOpenAt,
                 lastClickAt,
-                replied,
-                lastReplyAt,
-                lastReplySnippet,
-                repliesCount,
                 followupSkipped,
                 skippedReason,
                 skippedAt,
@@ -700,49 +631,6 @@ export default function CampaignInsight() {
         setSseLog(sseLogRef.current);
       } catch (e) {
         console.warn('Malformed campaign SSE payload', e);
-      }
-    });
-
-    es.addEventListener('reply', (ev: any) => {
-      // Some servers might publish reply events separately; handle defensively
-      try {
-        let payloadRaw = ev.data;
-        let payload: any;
-        try { payload = JSON.parse(payloadRaw); } catch { payload = { raw: String(payloadRaw) }; }
-
-        const updatedContactId = payload.contactId ?? payload.contact?.contactId ?? null;
-        if (!updatedContactId) {
-          scheduleSilentTableRefresh();
-          return;
-        }
-
-        const contactIdStr = String(updatedContactId);
-        setItems(prev => {
-          let matched = false;
-          const next = prev.map(row => {
-            const rowContactId = row.contactId != null ? String(row.contactId) : null;
-            const rowIdStr = row.id != null ? String(row.id) : null;
-            if ((rowContactId && rowContactId === contactIdStr) || (rowIdStr && rowIdStr === contactIdStr)) {
-              matched = true;
-              const repliesCount = Math.max(1, (typeof payload.repliesCount === 'number' ? payload.repliesCount : (row.repliesCount ?? 0) + 1));
-              return {
-                ...row,
-                replied: true,
-                lastReplyAt: payload.receivedAt ?? payload.repliedAt ?? new Date().toISOString(),
-                lastReplySnippet: payload.snippet ?? payload.lastReplySnippet ?? row.lastReplySnippet,
-                repliesCount,
-              };
-            }
-            return row;
-          });
-          if (!matched) scheduleSilentTableRefresh(); else loadInsight(true);
-          const logEntry = { ts: new Date().toISOString(), type: 'reply', payload };
-          sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
-          setSseLog(sseLogRef.current);
-          return next;
-        });
-      } catch (e) {
-        console.warn('Malformed reply SSE payload', e);
       }
     });
 
@@ -894,40 +782,6 @@ export default function CampaignInsight() {
     }
   }
 
-  // ---- Replies UI ----
-  async function openRepliesModalFor(row: ContactRow) {
-    setRepliesModalOpen(true);
-    setRepliesModalContact({ contactId: row.contactId, email: row.email });
-    setRepliesForContact([]);
-    setLoadingReplies(true);
-    try {
-      // Attempt multiple query strategies:
-      let url = `/api/campaign/${id}/replies?`;
-      if (row.contactId) url += `contactId=${encodeURIComponent(String(row.contactId))}`;
-      else url += `contactId=${encodeURIComponent(String(row.id))}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        const body = await safeJson(res).catch(() => ({ error: 'Unknown' }));
-        throw new Error((body && (body as any).error) ? (body as any).error : `Failed to fetch replies (${res.status})`);
-      }
-      const body = await res.json();
-      const docs: ReplyDoc[] = Array.isArray(body.items) ? body.items : (Array.isArray(body) ? body : []);
-      setRepliesForContact(docs);
-    } catch (e) {
-      console.error('Failed loading replies for contact', e);
-      setRepliesForContact([]);
-      alert('Failed to load replies: ' + ((e as any).message ?? String(e)));
-    } finally {
-      setLoadingReplies(false);
-    }
-  }
-
-  function closeRepliesModal() {
-    setRepliesModalOpen(false);
-    setRepliesModalContact(null);
-    setRepliesForContact([]);
-  }
-
   // Helper to render attachment download link; will create data URL if inline base64 provided
   function renderAttachmentLink(att: any) {
     const filename = att.filename || att.name || 'attachment';
@@ -948,12 +802,171 @@ export default function CampaignInsight() {
     return (<span title={att.sha256 || ''}>{filename}{size ? ` (${size})` : ''}</span>);
   }
 
+  // ----------------------
+  // Manual Hold / Undo related functions (new)
+  // ----------------------
+
+  // Helper to get a contact identifier to send to API (prefer contactId)
+  function getApiContactId(rowOrId: ContactRow | string | null) {
+    if (!rowOrId) return null;
+    if (typeof rowOrId === 'string') return rowOrId;
+    return rowOrId.contactId ?? rowOrId.id ?? null;
+  }
+
+  async function holdContact(rowOrId: ContactRow | string | null) {
+    if (!id || actionInProgress) return;
+    const contactId = getApiContactId(rowOrId);
+    if (!contactId) {
+      alert('No contact identifier available for hold.');
+      return;
+    }
+    if (!confirm('Place this contact on manual hold? This will remove any queued jobs and prevent automatic retries until released.')) return;
+
+    setActionInProgress(true);
+    try {
+      // optimistic update (mark held locally while request in-flight)
+      setItems(prev => prev.map(it => {
+        const cid = getApiContactId(it);
+        if (cid && String(cid) === String(contactId)) {
+          return { ...it, status: 'manual_hold', lastError: null };
+        }
+        return it;
+      }));
+
+      const res = await fetch(`/api/campaign/${id}/control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'manualHold', contactId }),
+      });
+      const body = await safeJson(res);
+      if (!res.ok) {
+        // reload from server to rollback optimistic state
+        await loadContacts({ silent: true });
+        throw new Error((body && (body as any).error) ? (body as any).error : `Hold failed (${res.status})`);
+      }
+
+      // refresh authoritative state
+      loadInsight(true);
+      loadContacts({ silent: true });
+
+      // sse log
+      const logEntry = { ts: new Date().toISOString(), type: 'manualHold', payload: { contactId, response: body } };
+      sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+      setSseLog(sseLogRef.current);
+    } catch (e: any) {
+      alert('Hold failed: ' + ((e && e.message) ? e.message : String(e)));
+    } finally {
+      setActionInProgress(false);
+    }
+  }
+
+  async function undoHoldContact(rowOrId: ContactRow | string | null) {
+    if (!id || actionInProgress) return;
+    const contactId = getApiContactId(rowOrId);
+    if (!contactId) {
+      alert('No contact identifier available for release.');
+      return;
+    }
+    if (!confirm('Release this contact from manual hold? It will be restored to its previous status (often pending) and may be re-enqueued.')) return;
+
+    setActionInProgress(true);
+    try {
+      // optimistic update (set to pending while request runs)
+      setItems(prev => prev.map(it => {
+        const cid = getApiContactId(it);
+        if (cid && String(cid) === String(contactId)) {
+          return { ...it, status: 'pending' };
+        }
+        return it;
+      }));
+
+      const res = await fetch(`/api/campaign/${id}/control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'manualUndo', contactId }),
+      });
+      const body = await safeJson(res);
+      if (!res.ok) {
+        await loadContacts({ silent: true });
+        throw new Error((body && (body as any).error) ? (body as any).error : `Release failed (${res.status})`);
+      }
+
+      loadInsight(true);
+      loadContacts({ silent: true });
+
+      const logEntry = { ts: new Date().toISOString(), type: 'manualUndo', payload: { contactId, response: body } };
+      sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+      setSseLog(sseLogRef.current);
+    } catch (e: any) {
+      alert('Release failed: ' + ((e && e.message) ? e.message : String(e)));
+    } finally {
+      setActionInProgress(false);
+    }
+  }
+
+  // Release all held contacts currently visible in the table (current page)
+  async function releaseAllHeld() {
+    if (!id || actionInProgress) return;
+    const held = items.filter(it => (it.status ?? '').toString() === 'manual_hold');
+    if (held.length === 0) {
+      alert('No held contacts in the current page to release.');
+      return;
+    }
+    if (!confirm(`Release all held contacts visible here? (${held.length} contacts). This will attempt to release each one.`)) return;
+
+    setActionInProgress(true);
+    try {
+      const CHUNK = 6;
+      let succeeded = 0;
+      let failed = 0;
+      for (let i = 0; i < held.length; i += CHUNK) {
+        const batch = held.slice(i, i + CHUNK);
+        const promises = batch.map(row => {
+          const contactId = getApiContactId(row);
+          return fetch(`/api/campaign/${id}/control`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'manualUndo', contactId }),
+          }).then(async (res) => {
+            const body = await safeJson(res);
+            if (!res.ok) throw body || new Error(`status ${res.status}`);
+            return { ok: true, contactId };
+          }).catch((err) => ({ ok: false, contactId, err }));
+        });
+
+        const results = await Promise.all(promises);
+        for (const r of results) {
+          if (r.ok) succeeded++; else failed++;
+        }
+        // small throttle
+        await new Promise(r => setTimeout(r, 120));
+      }
+
+      loadInsight();
+      loadContacts();
+
+      alert(`Release attempted. Succeeded: ${succeeded}, Failed: ${failed}. Check SSE log for details.`);
+      const logEntry = { ts: new Date().toISOString(), type: 'manualUndo_bulk', payload: { attempted: held.length, succeeded, failed } };
+      sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+      setSseLog(sseLogRef.current);
+    } catch (e) {
+      console.error('Release all held failed', e);
+      alert('Release all failed: ' + ((e as any)?.message ?? String(e)));
+    } finally {
+      setActionInProgress(false);
+    }
+  }
+
   // UI render
-  const statusOptions = (availableStatuses.length > 0 ? ['all', ...availableStatuses] : ['all', 'pending', 'sending', 'sent', 'failed', 'bounced', 'cancelled']).concat(['replied', 'no_reply']);
+  const statusOptions = (availableStatuses.length > 0 ? ['all', ...availableStatuses] : ['all', 'pending', 'sending', 'sent', 'failed', 'bounced', 'cancelled']).concat(['manual_hold']);
 
   // derive top-links safe list
   const topLinks = (engagement?.links || []).map(l => ({ url: l.url || '—', clicks: l.clicks }));
   const maxClicks = topLinks.length > 0 ? Math.max(...topLinks.map(t => t.clicks || 0)) : 1;
+
+  // When tab is 'held', filter displayed items to only manual_hold
+  const displayedItems = tab === 'held' ? items.filter(it => (it.status ?? '').toString() === 'manual_hold') : items;
+  const heldCount = items.filter(it => (it.status ?? '').toString() === 'manual_hold').length;
 
   return (
     <div style={{ padding: 24, fontFamily: 'sans-serif', maxWidth: 1200 }}>
@@ -1049,6 +1062,7 @@ export default function CampaignInsight() {
 
         <div style={{ marginLeft: 'auto' }}>
           {breakdown && breakdown.failed > 0 && <button onClick={retryAllFailed} disabled={actionInProgress}>Retry all failed</button>}
+          {heldCount > 0 && <button onClick={releaseAllHeld} disabled={actionInProgress || engineLoading} style={{ marginLeft: 8 }}>Release all held ({heldCount})</button>}
         </div>
       </div>
 
@@ -1122,6 +1136,16 @@ export default function CampaignInsight() {
 
       {/* Filters */}
       <div style={{ marginTop: 16, display: 'flex', gap: 8, alignItems: 'center' }}>
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          View:
+          <div style={{ display: 'inline-flex', gap: 6 }}>
+            <button onClick={() => setTab('all')} style={{ padding: '6px 10px', borderRadius: 6, border: tab === 'all' ? '1px solid #888' : '1px solid #ddd', background: tab === 'all' ? '#fff' : '#fafafa' }}>All</button>
+            <button onClick={() => setTab('held')} style={{ padding: '6px 10px', borderRadius: 6, border: tab === 'held' ? '1px solid #888' : '1px solid #ddd', background: tab === 'held' ? '#fff' : '#fafafa' }}>
+              Held ({heldCount})
+            </button>
+          </div>
+        </label>
+
         <label>
           Status:
           <select value={statusQuery} onChange={(e) => updateQuery({ status: e.target.value, page: 1 })} style={{ marginLeft: 8 }}>
@@ -1144,7 +1168,7 @@ export default function CampaignInsight() {
       {/* Table */}
       <div style={{ marginTop: 12, border: '1px solid #ddd', borderRadius: 6, padding: 12, position: 'relative' }}>
         <div style={{ marginBottom: 8 }}>
-          <strong>Total:</strong> {total} • <strong>Page:</strong> {pageQuery} / {pages}
+          <strong>Total:</strong> {tab === 'held' ? heldCount : total} • <strong>Page:</strong> {pageQuery} / {pages}
         </div>
 
         <div style={{ opacity: tableLoading ? 0.6 : 1, transition: 'opacity 120ms linear' }}>
@@ -1163,8 +1187,8 @@ export default function CampaignInsight() {
               </tr>
             </thead>
             <tbody>
-              {items.length === 0 ? <tr><td colSpan={9} style={{ padding: 12, textAlign: 'center' }}>No records</td></tr> :
-                items.map(it => {
+              {displayedItems.length === 0 ? <tr><td colSpan={9} style={{ padding: 12, textAlign: 'center' }}>No records</td></tr> :
+                displayedItems.map(it => {
                   // prefer currentStepBgAttempts when available
                   const bgDone = (typeof it.currentStepBgAttempts === 'number') ? it.currentStepBgAttempts >= maxAttempts : (typeof it.bgAttempts === 'number' ? it.bgAttempts >= maxAttempts : true);
                   // can manual retry when status failed and attempts < maxAttempts (attempts is active step attempts)
@@ -1182,6 +1206,8 @@ export default function CampaignInsight() {
                   else if (fuState.followupStatus === 'due') fuBadge = 'Due';
                   else fuBadge = '—';
 
+                  const isHeld = (it.status ?? '').toString() === 'manual_hold';
+
                   return (
                     <tr key={it.id} style={{ borderBottom: '1px solid #eee' }}>
                       <td style={{ padding: 8 }}>
@@ -1189,12 +1215,9 @@ export default function CampaignInsight() {
                           <div style={{ minWidth: 320, overflow: 'hidden' }}>
                             <div style={{ fontSize: 14, fontWeight: 500 }}>{it.email ?? it.contactId ?? '—'}</div>
                             <div style={{ fontSize: 12, color: '#666' }}>{it.contactId ?? ''}</div>
-                            {it.replied && (
-                              <div style={{ marginTop: 6 }}>
-                                <span style={{ background: '#fff7e6', color: '#a66f00', padding: '4px 8px', borderRadius: 999, fontSize: 12 }}>Replied</span>
-                                {it.repliesCount ? <span style={{ marginLeft: 8, fontSize: 12, color: '#666' }}>{it.repliesCount} reply(ies)</span> : null}
-                                {it.lastReplyAt ? <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Last reply: {new Date(it.lastReplyAt).toLocaleString()}</div> : null}
-                                {it.lastReplySnippet ? <div style={{ marginTop: 6, fontSize: 13, color: '#333' }}>{String(it.lastReplySnippet).slice(0, 200)}{String(it.lastReplySnippet).length > 200 ? '…' : ''}</div> : null}
+                            {isHeld && (
+                              <div style={{ marginTop: 8 }}>
+                                <span style={{ background: '#fff0f6', color: '#8a1a4b', padding: '4px 8px', borderRadius: 999, fontSize: 12 }}>Held</span>
                               </div>
                             )}
                           </div>
@@ -1247,7 +1270,13 @@ export default function CampaignInsight() {
                       <td style={{ padding: 8 }}>
                         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                           <button disabled={actionInProgress || !canManualRetry} onClick={() => retryContact(it.contactId)} title={!canManualRetry ? (it.attempts >= maxAttempts ? 'Reached max attempts' : 'Background retries in progress or not failed') : 'Retry this contact'}>Retry</button>
-                          <button onClick={() => openRepliesModalFor(it)} title="View replies for this contact">View replies</button>
+
+                          {/* Hold / Undo per-contact */}
+                          {isHeld ? (
+                            <button onClick={() => undoHoldContact(it.contactId)} disabled={actionInProgress} title="Release this contact from manual hold">Undo</button>
+                          ) : (
+                            <button onClick={() => holdContact(it.contactId)} disabled={actionInProgress} title="Place this contact on manual hold">Hold</button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -1274,69 +1303,11 @@ export default function CampaignInsight() {
         )}
 
         <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button onClick={() => updateQuery({ page: Math.max(1, pageQuery - 1) })} disabled={pageQuery <= 1}>Prev</button>
+          <button onClick={() => updateQuery({ page: Math.max(1, pageQuery - 1) })} disabled={pageQuery <= 1 || tab === 'held'}>Prev</button>
           <div>Page {pageQuery} / {pages}</div>
-          <button onClick={() => updateQuery({ page: Math.min(pages, pageQuery + 1) })} disabled={pageQuery >= pages}>Next</button>
+          <button onClick={() => updateQuery({ page: Math.min(pages, pageQuery + 1) })} disabled={pageQuery >= pages || tab === 'held'}>Next</button>
         </div>
       </div>
-
-      {/* Replies modal */}
-      {repliesModalOpen && (
-        <div style={{
-          position: 'fixed', left: 0, right: 0, top: 0, bottom: 0, background: 'rgba(0,0,0,0.4)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000
-        }}>
-          <div style={{ width: '90%', maxWidth: 900, maxHeight: '90%', overflow: 'auto', background: '#fff', borderRadius: 8, padding: 16 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <strong>Replies for</strong>
-                <div style={{ fontSize: 13, color: '#666' }}>{repliesModalContact?.email ?? repliesModalContact?.contactId ?? '—'}</div>
-              </div>
-              <div>
-                <button onClick={closeRepliesModal}>Close</button>
-              </div>
-            </div>
-
-            <div style={{ marginTop: 12 }}>
-              {loadingReplies ? <div>Loading replies…</div> : (
-                repliesForContact.length === 0 ? <div style={{ color: '#666' }}>No replies found.</div> :
-                  repliesForContact.map((r, idx) => (
-                    <div key={r._id ?? r.fingerprint ?? idx} style={{ border: '1px solid #eee', padding: 12, borderRadius: 6, marginBottom: 12 }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <div>
-                          <div style={{ fontWeight: 600 }}>{r.subject ?? '(no subject)'}</div>
-                          <div style={{ fontSize: 12, color: '#666' }}>{r.from} • {r.receivedAt ? new Date(r.receivedAt).toLocaleString() : ''}</div>
-                        </div>
-                        <div style={{ fontSize: 12, color: '#666' }}>{r.source ?? ''}</div>
-                      </div>
-
-                      {r.text ? (
-                        <div style={{ marginTop: 8, whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 13 }}>{r.text}</div>
-                      ) : r.html ? (
-                        <div style={{ marginTop: 8 }}>
-                          <div dangerouslySetInnerHTML={{ __html: r.html ?? '' }} />
-                        </div>
-                      ) : null}
-
-                      {r.attachments && r.attachments.length > 0 && (
-                        <div style={{ marginTop: 8 }}>
-                          <div style={{ fontWeight: 600 }}>Attachments</div>
-                          <ul>
-                            {r.attachments.map((a, ai) => (
-                              <li key={ai}>
-                                {renderAttachmentLink(a)}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                    </div>
-                  ))
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

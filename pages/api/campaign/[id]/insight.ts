@@ -45,11 +45,12 @@ export default async function handler(
       ])
       .toArray();
 
-    const breakdown = { pending: 0, sent: 0, failed: 0 };
+    const breakdown = { pending: 0, sent: 0, failed: 0, manual_hold: 0 };
     for (const row of aggregation) {
       if (row._id === 'pending') breakdown.pending = row.count;
       else if (row._id === 'sent') breakdown.sent = row.count;
       else if (row._id === 'failed') breakdown.failed = row.count;
+      else if (row._id === 'manual_hold') breakdown.manual_hold = row.count;
     }
 
     const totals = {
@@ -59,6 +60,18 @@ export default async function handler(
       failed: breakdown.failed,
     };
 
+    // queuedEstimate (best-effort)
+    const queuedEstimate = (() => {
+      try {
+        const intended = Number(redisMeta?.total ?? campaign.totals?.intended ?? 0);
+        const processed = Number(breakdown.sent + breakdown.failed);
+        if (Number.isFinite(intended - processed)) return Math.max(0, intended - processed);
+        return null;
+      } catch {
+        return null;
+      }
+    })();
+
     // --- Recent failures ---
     const recentFailures = await db
       .collection('campaign_contacts')
@@ -66,6 +79,54 @@ export default async function handler(
       .sort({ lastAttemptAt: -1 })
       .limit(10)
       .toArray();
+
+    // --- Recent manual holds (for UI to inspect) ---
+    let recentManualHolds: Array<any> = [];
+    try {
+      const holds = await db
+        .collection('campaign_contacts')
+        .find({ campaignId, status: 'manual_hold' })
+        .sort({ 'manualHistory.at': -1 }) // best-effort; if manualHistory.at not indexed this still returns
+        .limit(10)
+        .toArray();
+
+      recentManualHolds = await Promise.all(holds.map(async (h) => {
+        // try to resolve contact email if present in the ledger row, otherwise attempt contacts collection
+        let email = h.email ?? null;
+        try {
+          if (!email && h.contactId) {
+            const maybeContactId = h.contactId;
+            const contactDoc = await db.collection('contacts').findOne({ _id: maybeContactId });
+            if (contactDoc && contactDoc.email) email = contactDoc.email;
+          }
+        } catch (_) { /* ignore */ }
+
+        // find last hold entry in manualHistory
+        let heldAt: string | null = null;
+        let prevStatus: string | null = null;
+        try {
+          const mh = Array.isArray(h.manualHistory) ? h.manualHistory : [];
+          for (let i = mh.length - 1; i >= 0; i--) {
+            const e = mh[i];
+            if (e && e.action === 'hold') {
+              heldAt = e.at ? new Date(e.at).toISOString() : null;
+              prevStatus = e.prevStatus ?? null;
+              break;
+            }
+          }
+        } catch (_) { /* ignore parsing errors */ }
+
+        return {
+          contactId: h.contactId?.toString?.() ?? h.contactId,
+          email,
+          prevStatus,
+          heldAt,
+        };
+      }));
+    } catch (e) {
+      console.warn('Failed to fetch recent manual holds', e);
+      recentManualHolds = [];
+    }
 
     // --------------------------------------------------
     // Engagement analytics (campaign_events)
@@ -106,19 +167,47 @@ export default async function handler(
     const engagement = {
       opens: {
         total: openCount,
-        unique: uniqueOpeners.length,
-        rate: sent > 0 ? uniqueOpeners.length / sent : 0,
+        unique: Array.isArray(uniqueOpeners) ? uniqueOpeners.length : 0,
+        rate: sent > 0 ? (Array.isArray(uniqueOpeners) ? uniqueOpeners.length : 0) / sent : 0,
       },
       clicks: {
         total: clickCount,
-        unique: uniqueClickers.length,
-        rate: sent > 0 ? uniqueClickers.length / sent : 0,
+        unique: Array.isArray(uniqueClickers) ? uniqueClickers.length : 0,
+        rate: sent > 0 ? (Array.isArray(uniqueClickers) ? uniqueClickers.length : 0) / sent : 0,
       },
       links: topLinks.map(l => ({
         url: l._id,
         clicks: l.clicks,
       })),
     };
+
+    // --- Campaign-level health snapshot (from Redis, best-effort) ---
+    let health: Array<{ domain: string; sent: number; failed: number; failRate: number; lastUpdated?: number }> = [];
+    try {
+      if (redis?.status === 'ready' || (redis as any).isOpen) {
+        const h = await redis.hgetall(`campaign:${id}:health`);
+        // h is flat map with keys like "domain:example.com:sent" etc. Convert into domain buckets.
+        const buckets: Record<string, any> = {};
+        for (const key of Object.keys(h || {})) {
+          // key pattern: domain:{domain}:sent, domain:{domain}:failed, domain:{domain}:lastUpdated
+          const m = key.match(/^domain:(.+?):(sent|failed|lastUpdated)$/);
+          if (!m) continue;
+          const domain = m[1];
+          const field = m[2];
+          buckets[domain] = buckets[domain] || { domain, sent: 0, failed: 0, lastUpdated: undefined };
+          if (field === 'sent') buckets[domain].sent = Number(h[key] || 0);
+          else if (field === 'failed') buckets[domain].failed = Number(h[key] || 0);
+          else if (field === 'lastUpdated') buckets[domain].lastUpdated = Number(h[key] || undefined);
+        }
+        health = Object.values(buckets).map((b: any) => {
+          const total = (b.sent || 0) + (b.failed || 0);
+          return { domain: b.domain, sent: b.sent || 0, failed: b.failed || 0, failRate: total === 0 ? 0 : (b.failed / total), lastUpdated: b.lastUpdated };
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to read campaign health from redis', e);
+      health = [];
+    }
 
     // --------------------------------------------------
 
@@ -135,6 +224,7 @@ export default async function handler(
       },
       totals,
       breakdown,
+      queuedEstimate,
       engagement,
       // replies summary
       replies: {
@@ -148,6 +238,8 @@ export default async function handler(
         error: f.lastError ?? null,
         lastAttemptAt: f.lastAttemptAt,
       })),
+      manualHolds: recentManualHolds,
+      health,
       maxAttempts: MAX_ATTEMPTS,
     });
   } catch (err) {

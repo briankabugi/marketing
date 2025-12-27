@@ -297,6 +297,28 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       const currentStepAttempts = typeof r.currentStepAttempts === 'number' ? r.currentStepAttempts : (typeof r.attempts === 'number' ? r.attempts : 0);
       const currentStepBgAttempts = typeof r.currentStepBgAttempts === 'number' ? r.currentStepBgAttempts : (typeof r.bgAttempts === 'number' ? r.bgAttempts : 0);
 
+      // Manual hold metadata (new)
+      let manualHold = false;
+      let manualPrevStatus: string | null = null;
+      let manualHoldAt: string | null = null;
+      try {
+        if (r.status === 'manual_hold') manualHold = true;
+        const mh = Array.isArray(r.manualHistory) ? r.manualHistory : [];
+        // find last hold entry in history
+        if (mh.length > 0) {
+          for (let i = mh.length - 1; i >= 0; i--) {
+            const h = mh[i];
+            if (h && h.action === 'hold') {
+              manualPrevStatus = h.prevStatus ?? null;
+              manualHoldAt = h.at ? (new Date(h.at)).toISOString() : null;
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        // ignore history parsing errors
+      }
+
       return {
         id: r._id?.toString?.() ?? String(r._id),
         contactId: r.contactId && r.contactId.toString ? r.contactId.toString() : String(r.contactId ?? null),
@@ -331,6 +353,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         // skipped info: prefer ledger values, fall back to aggregated events
         lastFollowupSkippedAt: lastSkippedAtFromLedger ?? (fuInfo.lastSkippedAt ?? null),
         lastFollowupSkippedReason: lastSkippedReasonFromLedger ?? (fuInfo.lastSkippedReason ?? null),
+
+        // manual hold / override fields (added)
+        manualHold,
+        manualPrevStatus,
+        manualHoldAt,
+        // include raw manualHistory only when explicitly requested? keep minimal footprint here
       };
     });
 

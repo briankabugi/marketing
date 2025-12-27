@@ -16,7 +16,7 @@ const RESUME_ENQUEUE_LIMIT = Number(process.env.RESUME_ENQUEUE_LIMIT || 5000);
 // how long before a 'sending' row is considered stale and eligible for recovery (ms)
 const STALE_SENDING_MS = Number(process.env.STALE_SENDING_MS || 90_000);
 
-type Action = 'pause' | 'resume' | 'cancel' | 'delete' | 'retryFailed' | 'retryContact' | 'reconcile';
+type Action = 'pause' | 'resume' | 'cancel' | 'delete' | 'retryFailed' | 'retryContact' | 'reconcile' | 'manualHold' | 'manualUndo';
 
 async function safeHSet(key: string, obj: Record<string, string>) {
   try {
@@ -64,6 +64,37 @@ async function removeQueuedJobsForCampaign(campaignId: string) {
     return matched.length;
   } catch (err) {
     console.warn('Failed to enumerate/remove jobs for campaign', err);
+    return 0;
+  }
+}
+
+/**
+ * Remove any queued jobs that belong to a specific campaign + contact.
+ * Returns the number of removed jobs (best-effort).
+ */
+async function removeQueuedJobsForContact(campaignId: string, contactId: string) {
+  try {
+    const jobs = await queue.getJobs(['waiting', 'delayed', 'active', 'paused'], 0, -1);
+    const matched = jobs.filter((j) => {
+      try {
+        return String(j.data?.campaignId) === String(campaignId) && String(j.data?.contactId) === String(contactId);
+      } catch {
+        return false;
+      }
+    });
+
+    let removed = 0;
+    for (const j of matched) {
+      try {
+        await j.remove();
+        removed++;
+      } catch (e) {
+        console.warn(`Failed to remove job ${j.id} for contact ${contactId}`, e);
+      }
+    }
+    return removed;
+  } catch (e) {
+    console.warn('Failed to enumerate/remove jobs for contact', e);
     return 0;
   }
 }
@@ -171,7 +202,7 @@ export default async function handler(
     contactId?: string;
   };
 
-  if (!action || !['pause', 'resume', 'cancel', 'delete', 'retryFailed', 'retryContact', 'reconcile'].includes(action)) {
+  if (!action || !['pause', 'resume', 'cancel', 'delete', 'retryFailed', 'retryContact', 'reconcile', 'manualHold', 'manualUndo'].includes(action)) {
     return res.status(400).json({ error: 'Invalid action' });
   }
 
@@ -782,6 +813,190 @@ export default async function handler(
       await safePublish('campaign:new', { id, action: 'retryContact', contactId });
 
       return res.status(200).json({ ok: true, retried: 1, contactId });
+    }
+
+    // ACTION: Manual Hold (Manual Override) - place contact into a human-controlled hold state
+    if (action === 'manualHold') {
+      if (!contactId || typeof contactId !== 'string') {
+        return res.status(400).json({ error: 'Missing contactId for manualHold' });
+      }
+
+      // Find ledger row
+      let contactObjId;
+      try {
+        contactObjId = new ObjectId(contactId);
+      } catch {
+        contactObjId = contactId;
+      }
+
+      const doc = await db.collection('campaign_contacts').findOne({
+        campaignId: campaignObjectId,
+        contactId: contactObjId,
+      });
+
+      if (!doc) {
+        return res.status(404).json({ error: 'Contact ledger row not found for campaign' });
+      }
+
+      // If already in manual_hold, no-op
+      if (doc.status === 'manual_hold') {
+        return res.status(200).json({ ok: true, message: 'Contact already under manual hold' });
+      }
+
+      const prevStatus = doc.status ?? null;
+      const now = new Date();
+
+      // Remove any queued jobs for this contact (best-effort)
+      const cidStr = contactObjId.toString ? contactObjId.toString() : String(contactObjId);
+      const removedJobs = await removeQueuedJobsForContact(id, cidStr);
+
+      // Atomically update ledger: set status manual_hold and push history entry
+      try {
+        await db.collection('campaign_contacts').updateOne(
+          { _id: doc._id },
+          {
+            $set: { status: 'manual_hold', lastError: null },
+            $push: {
+              manualHistory: {
+                at: now,
+                by: 'user',
+                action: 'hold',
+                prevStatus,
+                removedJobs: removedJobs,
+              }
+            }
+          }
+        );
+      } catch (e) {
+        console.warn('Failed to set manual_hold on ledger row', e);
+        return res.status(500).json({ error: 'failed-to-apply-manual-hold' });
+      }
+
+      // Publish contact-level update for UI
+      try {
+        await safePublish(`campaign:${id}:contact_update`, {
+          contactId: cidStr,
+          status: 'manual_hold',
+          prevStatus,
+          manualActionAt: now.toISOString(),
+          removedJobs,
+        });
+      } catch (_) { }
+
+      await safePublish('campaign:new', { id, action: 'manualHold', contactId: cidStr });
+
+      return res.status(200).json({ ok: true, action: 'manual_hold', contactId: cidStr, removedJobs });
+    }
+
+    // ACTION: Manual Undo (release previously held contact)
+    if (action === 'manualUndo') {
+      if (!contactId || typeof contactId !== 'string') {
+        return res.status(400).json({ error: 'Missing contactId for manualUndo' });
+      }
+
+      // Find ledger row
+      let contactObjId2;
+      try {
+        contactObjId2 = new ObjectId(contactId);
+      } catch {
+        contactObjId2 = contactId;
+      }
+
+      const doc2 = await db.collection('campaign_contacts').findOne({
+        campaignId: campaignObjectId,
+        contactId: contactObjId2,
+      });
+
+      if (!doc2) {
+        return res.status(404).json({ error: 'Contact ledger row not found for campaign' });
+      }
+
+      if (doc2.status !== 'manual_hold') {
+        return res.status(400).json({ error: 'Contact is not under manual hold' });
+      }
+
+      const history = Array.isArray(doc2.manualHistory) ? doc2.manualHistory : [];
+      // Find the last hold entry to determine previous status to restore
+      let lastHoldEntry: any = null;
+      for (let i = history.length - 1; i >= 0; i--) {
+        const h = history[i];
+        if (h && h.action === 'hold') {
+          lastHoldEntry = h;
+          break;
+        }
+      }
+
+      if (!lastHoldEntry) {
+        // fallback: if no history, restore to 'pending' conservatively
+        lastHoldEntry = { prevStatus: 'pending', at: null };
+      }
+
+      const restoreTo = lastHoldEntry.prevStatus ?? 'pending';
+      const now2 = new Date();
+
+      // Update ledger: set status back to restoreTo and push a release history entry.
+      try {
+        await db.collection('campaign_contacts').updateOne(
+          { _id: doc2._id },
+          {
+            $set: { status: restoreTo, lastError: null },
+            $push: {
+              manualHistory: {
+                at: now2,
+                by: 'user',
+                action: 'release',
+                restoredTo: restoreTo,
+                refHoldAt: lastHoldEntry.at ?? null,
+              }
+            }
+          }
+        );
+      } catch (e) {
+        console.warn('Failed to release manual_hold on ledger row', e);
+        return res.status(500).json({ error: 'failed-to-release-manual-hold' });
+      }
+
+      const cidStr2 = contactObjId2.toString ? contactObjId2.toString() : String(contactObjId2);
+
+      // If we restored to pending, attempt to re-enqueue the job (best-effort)
+      let enqueued = false;
+      try {
+        if (restoreTo === 'pending') {
+          // decide job type based on doc2.step presence
+          const contactObjForJob = doc2.contactId ? (doc2.contactId.toString ? doc2.contactId.toString() : String(doc2.contactId)) : (doc2._id.toString ? doc2._id.toString() : String(doc2._id));
+          if (doc2.step) {
+            await queue.add(
+              'followup',
+              { campaignId: id, contactId: contactObjForJob, step: doc2.step },
+              { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
+            );
+          } else {
+            await queue.add(
+              'initial',
+              { campaignId: id, contactId: contactObjForJob },
+              { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
+            );
+          }
+          enqueued = true;
+        }
+      } catch (e) {
+        console.warn('Failed to enqueue job when releasing manual hold', e);
+        // Do not revert status change; surface best-effort result below
+      }
+
+      // Publish contact-level update
+      try {
+        await safePublish(`campaign:${id}:contact_update`, {
+          contactId: cidStr2,
+          status: restoreTo,
+          manualActionAt: now2.toISOString(),
+          requeued: enqueued,
+        });
+      } catch (_) { }
+
+      await safePublish('campaign:new', { id, action: 'manualUndo', contactId: cidStr2, restoredTo: restoreTo, requeued: enqueued });
+
+      return res.status(200).json({ ok: true, action: 'manualUndo', contactId: cidStr2, restoredTo: restoreTo, requeued: enqueued });
     }
 
     // Should not reach here

@@ -1,4 +1,3 @@
-
 // workers/campaignWorker.ts
 import 'dotenv/config'; // critical
 import { Worker, Queue, Job } from 'bullmq';

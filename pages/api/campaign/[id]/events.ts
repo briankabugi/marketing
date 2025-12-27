@@ -71,19 +71,42 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       try {
         payload = typeof message === 'string' ? JSON.parse(message) : message;
       } catch {
+        // message may already be a JS object or be non-JSON; keep raw string in payload.raw
         payload = { raw: String(message) };
       }
 
-      console.log('[SSE] redis message', channel, message);
+      // Debug log
+      // console.log('[SSE] redis message', channel, payload);
 
+      // Filter global campaign:new events so only clients interested in this campaign get updates
       if (channel === 'campaign:new') {
+        // If payload has an id and it doesn't match, ignore.
+        // If payload has no id but includes signals like refreshContacts, allow through as a generic campaign-level notification.
+        const payloadId = payload && (payload.id ?? payload.campaignId ?? null);
+        if (payloadId && String(payloadId) !== String(id)) {
+          // not for this client
+          return;
+        }
         writeEvent('campaign', payload);
-      } else if (channel.endsWith(':contact_update')) {
-        writeEvent('contact', payload);
-      } else {
-        // generic events channel
-        writeEvent('campaign_event', { channel, payload });
+        return;
       }
+
+      // contact updates specifically for this campaign
+      if (channel.endsWith(':contact_update')) {
+        // payload may be { campaignId, contactId, ... } or just { contactId, ... }
+        // Forward as 'contact' event
+        writeEvent('contact', payload);
+        return;
+      }
+
+      // campaign-specific events channel (e.g. campaign:{id}:events)
+      if (channel === `campaign:${id}:events`) {
+        writeEvent('campaign_event', payload);
+        return;
+      }
+
+      // Fallback: if some other channel slipped through, forward generically but label it
+      writeEvent('campaign_event', { channel, payload });
     } catch (e) {
       console.warn('messageHandler error', e);
     }
