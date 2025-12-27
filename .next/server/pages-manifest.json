@@ -1,0 +1,10 @@
+{
+  "/_app": "pages/_app.js",
+  "/_error": "pages/_error.js",
+  "/_document": "pages/_document.js",
+  "/": "pages/index.js",
+  "/campaigns/[id]": "pages/campaigns/[id].js",
+  "/api/campaign/[id]/contacts": "pages/api/campaign/[id]/contacts.js",
+  "/api/campaign/[id]/insight": "pages/api/campaign/[id]/insight.js",
+  "/api/campaign/[id]/events": "pages/api/campaign/[id]/events.js"
+}

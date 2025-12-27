@@ -1,3 +1,4 @@
+// pages/api/campaign/[id]/insight.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
@@ -94,6 +95,12 @@ export default async function handler(
       ])
       .toArray();
 
+    // Replies summary (use campaign_events.reply as canonical)
+    const [replyCountTotal, replyUniqueContacts] = await Promise.all([
+      events.countDocuments({ campaignId, type: 'reply' }),
+      events.distinct('contactId', { campaignId, type: 'reply' }),
+    ]);
+
     const sent = breakdown.sent || 0;
 
     const engagement = {
@@ -122,10 +129,18 @@ export default async function handler(
         status: campaign.status,
         createdAt: campaign.createdAt,
         completedAt: campaign.completedAt ?? null,
+        // <-- add initial and followUps so UI can render them
+        initial: campaign.initial ?? null,
+        followUps: Array.isArray(campaign.followUps) ? campaign.followUps : [],
       },
       totals,
       breakdown,
       engagement,
+      // replies summary
+      replies: {
+        total: replyCountTotal,
+        uniqueContacts: Array.isArray(replyUniqueContacts) ? replyUniqueContacts.length : 0,
+      },
       recentFailures: recentFailures.map((f) => ({
         contactId: f.contactId?.toString?.() ?? f.contactId,
         email: f.email,

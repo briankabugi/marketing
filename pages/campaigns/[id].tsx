@@ -17,6 +17,40 @@ type ContactRow = {
   clicked?: boolean;
   lastOpenAt?: string | null;
   lastClickAt?: string | null;
+  // replies
+  replied?: boolean;
+  lastReplyAt?: string | null;
+  lastReplySnippet?: string | null;
+  repliesCount?: number;
+  // runtime SSE hints (may be present from SSE payloads)
+  followupSkipped?: boolean;
+  skippedReason?: string | null;
+  skippedAt?: string | null;
+  stepName?: string | null;
+
+  // New model fields (step-scoped)
+  followUpPlan?: Array<{
+    index?: number | null;
+    name?: string | null;
+    rule?: string | null;
+    status?: string | null;
+    scheduledFor?: string | null;
+    sentAt?: string | null;
+    skippedAt?: string | null;
+    skippedReason?: string | null;
+    delayMinutes?: number | null;
+  }>;
+  followupsCompleted?: number; // aggregated followup_sent / followup_skipped
+  nextFollowUpStep?: number | null; // 1-based index
+  nextFollowUpAt?: string | null;
+  followUpStatus?: string | null; // scheduled|done|skipped|...
+  lastStepSentAt?: string | null;
+
+  // current step scoped counters (explicit)
+  currentStepIndex?: number | null;
+  currentStepName?: string | null;
+  currentStepAttempts?: number;
+  currentStepBgAttempts?: number;
 };
 
 type InsightPayload = {
@@ -26,6 +60,14 @@ type InsightPayload = {
     status: string;
     createdAt?: string;
     completedAt?: string | null;
+    followUps?: Array<{
+      name?: string | null;
+      delayMinutes?: number;
+      rule?: string | any;
+      subject?: string;
+      body?: string;
+      attachments?: Array<{ name?: string; url?: string; contentType?: string | null; size?: number }>;
+    }>;
   };
   totals: {
     intended: number;
@@ -45,6 +87,32 @@ type InsightPayload = {
     clicks?: { total: number; unique: number; rate: number };
     links?: Array<{ url?: string; clicks: number }>;
   };
+  replies?: {
+    total?: number;
+    uniqueContacts?: number;
+  };
+};
+
+type ReplyDoc = {
+  _id?: string;
+  fingerprint?: string;
+  campaignId?: string;
+  contactId?: string;
+  from?: string;
+  to?: string;
+  subject?: string;
+  text?: string | null;
+  html?: string | null;
+  messageId?: string | null;
+  receivedAt?: string | Date;
+  source?: string;
+  attachments?: Array<{
+    filename?: string;
+    contentType?: string | null;
+    size?: number;
+    sha256?: string;
+    content?: string | null;
+  }>;
 };
 
 export default function CampaignInsight() {
@@ -52,12 +120,14 @@ export default function CampaignInsight() {
   const { id } = router.query as { id?: string };
 
   const [campaign, setCampaign] = React.useState<any>(null);
+  const [followUps, setFollowUps] = React.useState<any[]>([]);
   const [breakdown, setBreakdown] = React.useState<any>(null);
   const [totals, setTotals] = React.useState<any>(null);
   const [recentFailures, setRecentFailures] = React.useState<any[]>([]);
   const [maxAttempts, setMaxAttempts] = React.useState<number>(3);
 
   const [engagement, setEngagement] = React.useState<InsightPayload['engagement'] | null>(null);
+  const [repliesSummary, setRepliesSummary] = React.useState<{ total?: number; uniqueContacts?: number } | null>(null);
 
   const [items, setItems] = React.useState<ContactRow[]>([]);
   const [total, setTotal] = React.useState<number>(0);
@@ -66,6 +136,12 @@ export default function CampaignInsight() {
   const [availableStatuses, setAvailableStatuses] = React.useState<string[]>([]);
   const [actionInProgress, setActionInProgress] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
+
+  // Replies modal state
+  const [repliesModalOpen, setRepliesModalOpen] = React.useState(false);
+  const [repliesModalContact, setRepliesModalContact] = React.useState<{ contactId: string | null; email: string | null } | null>(null);
+  const [repliesForContact, setRepliesForContact] = React.useState<ReplyDoc[]>([]);
+  const [loadingReplies, setLoadingReplies] = React.useState(false);
 
   // engine / job UI state
   const [sseLog, setSseLog] = React.useState<any[]>([]);
@@ -106,6 +182,163 @@ export default function CampaignInsight() {
     }
   }
 
+  function humanizeDelay(minutesMaybe?: number | null) {
+    const minutes = Number(minutesMaybe ?? 0);
+    if (!minutes || minutes <= 0) return '0 minutes';
+    if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    const hours = minutes / 60;
+    if (hours < 24) {
+      const h = Math.round(hours * 10) / 10;
+      return `${h} hour${h === 1 ? '' : 's'}`;
+    }
+    const days = Math.round((hours / 24) * 10) / 10;
+    return `${days} day${days === 1 ? '' : 's'}`;
+  }
+
+  // Compute per-contact follow-up state derived from ledger + followUps array.
+  // Prefer explicit ledger/currentStep fields when present (new model).
+  function computeFollowupState(it: ContactRow) {
+    const steps = followUps || [];
+    if (!steps || steps.length === 0) {
+      return {
+        lastSentLabel: 'Initial',
+        followupsSent: 0,
+        nextIndex: null as number | null,
+        nextStepLabel: '—',
+        nextDueAt: null as Date | null,
+        followupStatus: 'no_sequence' as 'no_sequence' | 'complete' | 'scheduled' | 'due' | 'skipped' | 'unknown',
+        skipReason: null as string | null,
+        nextRule: null as string | null,
+      };
+    }
+
+    // Prefer explicit completed count if available
+    let completed = typeof it.followupsCompleted === 'number' ? it.followupsCompleted : null;
+
+    // Prefer ledger plan to compute completions if explicit completed not present
+    const ledgerPlan = Array.isArray(it.followUpPlan) ? it.followUpPlan : null;
+    if (completed === null && ledgerPlan) {
+      completed = ledgerPlan.filter((p) => {
+        if (!p) return false;
+        const st = (p.status || '').toString().toLowerCase();
+        if (st === 'sent' || !!p.sentAt) return true;
+        return false;
+      }).length;
+    }
+
+    // Fallback: legacy heuristic based on attempts/bgAttempts
+    if (completed === null) {
+      const sentCount = Math.max(it.attempts || 0, it.bgAttempts || 0);
+      // ensure at least 1 (initial)
+      const sent = Math.max(1, sentCount);
+      completed = Math.max(0, sent - 1);
+    }
+
+    const followupsSent = completed;
+
+    const lastSentLabel = followupsSent === 0 ? 'Initial' : `Follow-up ${followupsSent} (${(steps[followupsSent - 1]?.name) ?? 'step ' + followupsSent})`;
+
+    // Next follow-up index in `steps` (0-based index into steps)
+    const nextIndex = (typeof followupsSent === 'number' && followupsSent < steps.length) ? followupsSent : null;
+
+    if (nextIndex === null) {
+      return {
+        lastSentLabel,
+        followupsSent,
+        nextIndex: null,
+        nextStepLabel: '—',
+        nextDueAt: null,
+        followupStatus: 'complete' as const,
+        skipReason: null,
+        nextRule: null,
+      };
+    }
+
+    const fu = steps[nextIndex];
+    const nextStepLabel = `Follow-up ${nextIndex + 1}${fu?.name ? ` — ${fu.name}` : ''}`;
+    const delayMinutes = Number(fu?.delayMinutes ?? 0);
+
+    // Next due: prefer ledgerPlan[nextIndex].scheduledFor if present
+    let nextDueAt: Date | null = null;
+    try {
+      if (ledgerPlan && ledgerPlan[nextIndex] && ledgerPlan[nextIndex].scheduledFor) {
+        const d = new Date(ledgerPlan[nextIndex].scheduledFor as any);
+        if (!isNaN(d.getTime())) nextDueAt = d;
+      }
+      // fallback: use lastStepSentAt or lastAttemptAt + delay
+      if (!nextDueAt) {
+        const lastTsStr = it.lastStepSentAt ?? it.lastAttemptAt ?? null;
+        if (lastTsStr) {
+          const lastTs = new Date(lastTsStr).getTime();
+          if (!Number.isNaN(lastTs)) {
+            nextDueAt = new Date(lastTs + Math.round(delayMinutes * 60_000));
+          }
+        }
+      }
+    } catch {
+      nextDueAt = null;
+    }
+
+    // Determine rule type for next step
+    let ruleType = 'always';
+    try {
+      if (typeof fu?.rule === 'string') ruleType = fu.rule;
+      else if (fu && typeof fu.rule === 'object' && fu.rule?.type) ruleType = fu.rule.type;
+    } catch {
+      ruleType = 'always';
+    }
+
+    // Determine skip reason: prefer explicit ledger / API fields
+    let skipReason: string | null = null;
+    if (it.followUpStatus === 'skipped' && it.lastFollowupSkippedReason) {
+      skipReason = it.lastFollowupSkippedReason;
+    } else if (ledgerPlan) {
+      const skipped = ledgerPlan[nextIndex] && (ledgerPlan[nextIndex].status === 'skipped' || ledgerPlan[nextIndex].skippedAt);
+      if (skipped) {
+        skipReason = ledgerPlan[nextIndex].skippedReason ?? 'skipped';
+      }
+    }
+
+    // Also account for reply-based rules (no_reply/replied) with quick inference if possible
+    if (!skipReason && ruleType === 'no_reply' && it.replied) {
+      skipReason = 'replied';
+    } else if (!skipReason && ruleType === 'replied' && !it.replied) {
+      skipReason = 'requires-reply';
+    }
+
+    // Consider SSE-provided hint
+    if (!skipReason && it.followupSkipped) {
+      skipReason = it.skippedReason ?? 'rule';
+    }
+
+    // followUpStatus: prefer explicit if present
+    let followupStatus: 'no_sequence' | 'complete' | 'scheduled' | 'due' | 'skipped' | 'unknown' = 'unknown';
+    if (typeof it.followUpStatus === 'string') {
+      const s = it.followUpStatus.toLowerCase();
+      if (s === 'scheduled') followupStatus = 'scheduled';
+      else if (s === 'done' || s === 'completed') followupStatus = 'complete';
+      else if (s === 'skipped') followupStatus = 'skipped';
+      else followupStatus = s as any;
+    } else {
+      if (skipReason) followupStatus = 'skipped';
+      else if (!nextDueAt) followupStatus = 'scheduled';
+      else {
+        followupStatus = (Date.now() >= nextDueAt.getTime()) ? 'due' : 'scheduled';
+      }
+    }
+
+    return {
+      lastSentLabel,
+      followupsSent,
+      nextIndex,
+      nextStepLabel,
+      nextDueAt,
+      followupStatus,
+      skipReason,
+      nextRule: ruleType,
+    };
+  }
+
   // ----------------------
   // Data loading functions
   // ----------------------
@@ -135,6 +368,10 @@ export default function CampaignInsight() {
       setRecentFailures(body.recentFailures || []);
       setMaxAttempts(body.maxAttempts ?? 3);
       setEngagement(body.engagement ?? null);
+      setRepliesSummary(body.replies ?? null);
+
+      // set followups if present
+      setFollowUps(body.campaign?.followUps ?? []);
 
       // Quick queued estimate (intended - processed)
       const intended = Number(body.totals?.intended ?? 0);
@@ -179,22 +416,57 @@ export default function CampaignInsight() {
 
       if (!mountedRef.current) return;
 
-      // ensure attempts/bgAttempts are at least 1 for display consistency
-      const normalizedItems = (body.items || []).map((it: any) => ({
-        id: it.id,
-        contactId: it.contactId ?? null,
-        email: it.email ?? null,
-        status: it.status ?? null,
-        attempts: (typeof it.attempts === 'number' ? Math.max(1, it.attempts) : 1),
-        lastAttemptAt: it.lastAttemptAt ?? null,
-        lastError: it.lastError ?? null,
-        bgAttempts: (typeof it.bgAttempts === 'number' ? Math.max(1, it.bgAttempts) : (typeof it.bgAttempts === 'undefined' ? 0 : Number(it.bgAttempts))),
-        // engagement fields (if the API returns them)
-        opened: !!it.opened,
-        clicked: !!it.clicked,
-        lastOpenAt: it.lastOpenAt ?? null,
-        lastClickAt: it.lastClickAt ?? null,
-      })) as ContactRow[];
+      // ensure attempts/bgAttempts are normalized and include new step-scoped fields
+      const normalizedItems = (body.items || []).map((it: any) => {
+        const repliedFromApi = !!(it.replied || it.repliesCount || it.lastReplyAt);
+        return {
+          id: it.id,
+          contactId: it.contactId ?? null,
+          email: it.email ?? null,
+          status: it.status ?? null,
+          // 'attempts' under new model is the active step attempts; ensure sensible default
+          attempts: (typeof it.attempts === 'number' ? Math.max(1, it.attempts) : 1),
+          lastAttemptAt: it.lastAttemptAt ?? null,
+          lastError: it.lastError ?? null,
+          bgAttempts: (typeof it.bgAttempts === 'number' ? Math.max(0, it.bgAttempts) : (typeof it.bgAttempts === 'undefined' ? 0 : Number(it.bgAttempts))),
+          opened: !!it.opened,
+          clicked: !!it.clicked,
+          lastOpenAt: it.lastOpenAt ?? null,
+          lastClickAt: it.lastClickAt ?? null,
+          replied: repliedFromApi,
+          lastReplyAt: it.lastReplyAt ?? null,
+          lastReplySnippet: it.lastReplySnippet ?? null,
+          repliesCount: typeof it.repliesCount === 'number' ? it.repliesCount : (repliedFromApi ? 1 : 0),
+          followupSkipped: !!it.followupSkipped,
+          skippedReason: it.skippedReason ?? null,
+          skippedAt: it.skippedAt ?? null,
+          stepName: it.stepName ?? null,
+
+          // New model / ledger-backed fields
+          followUpPlan: Array.isArray(it.followUpPlan) ? it.followUpPlan.map((p: any) => ({
+            index: p?.index ?? null,
+            name: p?.name ?? null,
+            rule: p?.rule ?? null,
+            status: p?.status ?? null,
+            scheduledFor: p?.scheduledFor ? String(p.scheduledFor) : null,
+            sentAt: p?.sentAt ? String(p.sentAt) : null,
+            skippedAt: p?.skippedAt ? String(p.skippedAt) : null,
+            skippedReason: p?.skippedReason ?? null,
+            delayMinutes: (typeof p?.delayMinutes === 'number') ? p.delayMinutes : (p?.delayMinutes ? Number(p.delayMinutes) : null),
+          })) : undefined,
+
+          followupsCompleted: typeof it.followupsCompleted === 'number' ? it.followupsCompleted : undefined,
+          nextFollowUpStep: (typeof it.nextFollowUpStep === 'number' || it.nextFollowUpStep == null) ? it.nextFollowUpStep : undefined,
+          nextFollowUpAt: it.nextFollowUpAt ?? null,
+          followUpStatus: it.followUpStatus ?? null,
+          lastStepSentAt: it.lastStepSentAt ?? null,
+
+          currentStepIndex: (typeof it.currentStepIndex === 'number' || it.currentStepIndex == null) ? it.currentStepIndex : undefined,
+          currentStepName: it.currentStepName ?? null,
+          currentStepAttempts: typeof it.currentStepAttempts === 'number' ? it.currentStepAttempts : undefined,
+          currentStepBgAttempts: typeof it.currentStepBgAttempts === 'number' ? it.currentStepBgAttempts : undefined,
+        } as ContactRow;
+      }) as ContactRow[];
 
       // update atomically to reduce flicker
       setItems(normalizedItems);
@@ -256,7 +528,6 @@ export default function CampaignInsight() {
     };
 
     es.addEventListener('contact', (ev: any) => {
-      console.log('[SSE] contact event', ev.data)
       try {
         let payloadRaw = ev.data;
         let payload: any;
@@ -270,7 +541,6 @@ export default function CampaignInsight() {
         const contactIdStr = String(updatedContactId);
 
         setItems((prev) => {
-          console.log('[UI] attempting to patch row for', contactIdStr)
           let matched = false;
           const next = prev.map((row) => {
             const rowContactId = row.contactId != null ? String(row.contactId) : null;
@@ -288,37 +558,62 @@ export default function CampaignInsight() {
               let clicked = row.clicked ?? false;
               let lastOpenAt = row.lastOpenAt ?? null;
               let lastClickAt = row.lastClickAt ?? null;
+              let replied = row.replied ?? false;
+              let lastReplyAt = row.lastReplyAt ?? null;
+              let lastReplySnippet = row.lastReplySnippet ?? null;
+              let repliesCount = row.repliesCount ?? 0;
 
               // Normalize event timestamp fields robustly:
-              // prefer explicit openedAt/clickedAt, then lastOpenAt/lastClickAt, then ts, then fallback to now
               const normalizedOpenTs =
-                payload.openedAt ??
-                payload.lastOpenAt ??
-                payload.ts ??
-                payload.opened_at ??
-                null;
+                payload.openedAt ?? payload.lastOpenAt ?? payload.ts ?? payload.opened_at ?? null;
               const normalizedClickTs =
-                payload.clickedAt ??
-                payload.lastClickAt ??
-                payload.ts ??
-                payload.clicked_at ??
-                null;
+                payload.clickedAt ?? payload.lastClickAt ?? payload.ts ?? payload.clicked_at ?? null;
+              const normalizedReplyTs =
+                payload.repliedAt ?? payload.replyAt ?? payload.ts ?? null;
 
               if (payload.event === 'open' || normalizedOpenTs) {
                 opened = true;
                 lastOpenAt = String(normalizedOpenTs ?? new Date().toISOString());
               }
-
               if (payload.event === 'click' || normalizedClickTs) {
                 clicked = true;
                 lastClickAt = String(normalizedClickTs ?? new Date().toISOString());
               }
+              if (payload.event === 'reply' || normalizedReplyTs || payload.repliesCount) {
+                replied = true;
+                lastReplyAt = String(normalizedReplyTs ?? payload.lastReplyAt ?? new Date().toISOString());
+                if (payload.snippet || payload.lastReplySnippet) lastReplySnippet = payload.snippet ?? payload.lastReplySnippet;
+                if (typeof payload.repliesCount === 'number') repliesCount = payload.repliesCount;
+                else repliesCount = Math.max(1, repliesCount);
+              }
+
+              // followup skip hints from server
+              const followupSkipped = typeof payload.followupSkipped === 'boolean' ? payload.followupSkipped : row.followupSkipped;
+              const skippedReason = payload.skippedReason ?? row.skippedReason ?? null;
+              const skippedAt = payload.skippedAt ?? row.skippedAt ?? null;
+              const stepName = payload.stepName ?? row.stepName ?? null;
+
+              // Merge new model fields if present in SSE payload
+              const mergedFollowUpPlan = payload.followUpPlan ? payload.followUpPlan : row.followUpPlan;
+              const mergedFollowupsCompleted = (typeof payload.followupsCompleted === 'number') ? payload.followupsCompleted : row.followupsCompleted;
+              const mergedNextFollowUpAt = payload.nextFollowUpAt ?? row.nextFollowUpAt;
+              const mergedFollowUpStatus = payload.followUpStatus ?? row.followUpStatus;
+              const mergedLastStepSentAt = payload.lastStepSentAt ?? row.lastStepSentAt;
+
+              const mergedCurrentStepIndex = (typeof payload.currentStepIndex === 'number') ? payload.currentStepIndex : (typeof row.currentStepIndex === 'number' ? row.currentStepIndex : undefined);
+              const mergedCurrentStepName = payload.currentStepName ?? row.currentStepName;
+              const mergedCurrentStepAttempts = typeof payload.currentStepAttempts === 'number' ? payload.currentStepAttempts : row.currentStepAttempts;
+              const mergedCurrentStepBgAttempts = typeof payload.currentStepBgAttempts === 'number' ? payload.currentStepBgAttempts : row.currentStepBgAttempts;
 
               // Some publishers might send boolean flags directly
               if (typeof payload.opened === 'boolean') opened = payload.opened;
               if (typeof payload.clicked === 'boolean') clicked = payload.clicked;
+              if (typeof payload.replied === 'boolean') replied = payload.replied;
               if (payload.lastOpenAt) lastOpenAt = payload.lastOpenAt;
               if (payload.lastClickAt) lastClickAt = payload.lastClickAt;
+              if (payload.lastReplyAt) lastReplyAt = payload.lastReplyAt;
+              if (payload.lastReplySnippet) lastReplySnippet = payload.lastReplySnippet;
+              if (typeof payload.repliesCount === 'number') repliesCount = payload.repliesCount;
 
               return {
                 ...row,
@@ -331,38 +626,54 @@ export default function CampaignInsight() {
                 clicked,
                 lastOpenAt,
                 lastClickAt,
+                replied,
+                lastReplyAt,
+                lastReplySnippet,
+                repliesCount,
+                followupSkipped,
+                skippedReason,
+                skippedAt,
+                stepName,
+
+                // merge step-scoped fields
+                followUpPlan: mergedFollowUpPlan,
+                followupsCompleted: mergedFollowupsCompleted,
+                nextFollowUpAt: mergedNextFollowUpAt,
+                followUpStatus: mergedFollowUpStatus,
+                lastStepSentAt: mergedLastStepSentAt,
+
+                currentStepIndex: mergedCurrentStepIndex,
+                currentStepName: mergedCurrentStepName,
+                currentStepAttempts: mergedCurrentStepAttempts,
+                currentStepBgAttempts: mergedCurrentStepBgAttempts,
               };
             }
             return row;
           });
 
           if (!matched) {
-            console.log('[UI] contact not in current page, triggering refresh')
             scheduleSilentTableRefresh();
           } else {
-            // refresh counts silently so metrics like unique opens update without flicker
-            console.log('[UI] matched row, updating')
             loadInsight(true);
           }
 
+          // push to SSE log
+          const logEntry = {
+            ts: new Date().toISOString(),
+            type: 'contact',
+            payload,
+          };
+          sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+          setSseLog(sseLogRef.current);
+
           return next;
         });
-
-        // push to SSE log
-        const logEntry = {
-          ts: new Date().toISOString(),
-          type: 'contact',
-          payload,
-        };
-        sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
-        setSseLog(sseLogRef.current);
       } catch (e) {
         console.warn('Malformed contact SSE payload', e);
       }
     });
 
     es.addEventListener('campaign', (ev: any) => {
-      console.log('[SSE] campaign event', ev.data)
       try {
         const payloadRaw = ev.data;
         let payload: any;
@@ -380,7 +691,6 @@ export default function CampaignInsight() {
           loadContacts({ silent: true });
         }
 
-        // sse log
         const logEntry = {
           ts: new Date().toISOString(),
           type: 'campaign',
@@ -390,6 +700,49 @@ export default function CampaignInsight() {
         setSseLog(sseLogRef.current);
       } catch (e) {
         console.warn('Malformed campaign SSE payload', e);
+      }
+    });
+
+    es.addEventListener('reply', (ev: any) => {
+      // Some servers might publish reply events separately; handle defensively
+      try {
+        let payloadRaw = ev.data;
+        let payload: any;
+        try { payload = JSON.parse(payloadRaw); } catch { payload = { raw: String(payloadRaw) }; }
+
+        const updatedContactId = payload.contactId ?? payload.contact?.contactId ?? null;
+        if (!updatedContactId) {
+          scheduleSilentTableRefresh();
+          return;
+        }
+
+        const contactIdStr = String(updatedContactId);
+        setItems(prev => {
+          let matched = false;
+          const next = prev.map(row => {
+            const rowContactId = row.contactId != null ? String(row.contactId) : null;
+            const rowIdStr = row.id != null ? String(row.id) : null;
+            if ((rowContactId && rowContactId === contactIdStr) || (rowIdStr && rowIdStr === contactIdStr)) {
+              matched = true;
+              const repliesCount = Math.max(1, (typeof payload.repliesCount === 'number' ? payload.repliesCount : (row.repliesCount ?? 0) + 1));
+              return {
+                ...row,
+                replied: true,
+                lastReplyAt: payload.receivedAt ?? payload.repliedAt ?? new Date().toISOString(),
+                lastReplySnippet: payload.snippet ?? payload.lastReplySnippet ?? row.lastReplySnippet,
+                repliesCount,
+              };
+            }
+            return row;
+          });
+          if (!matched) scheduleSilentTableRefresh(); else loadInsight(true);
+          const logEntry = { ts: new Date().toISOString(), type: 'reply', payload };
+          sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
+          setSseLog(sseLogRef.current);
+          return next;
+        });
+      } catch (e) {
+        console.warn('Malformed reply SSE payload', e);
       }
     });
 
@@ -419,11 +772,9 @@ export default function CampaignInsight() {
 
     router.replace({ pathname: router.pathname, query: next }, undefined, { shallow: true })
       .then(() => {
-        // load silently to avoid clearing the table (prevents flicker while keeping data fresh)
         loadContacts({ status: next.status ?? 'all', page: Number(next.page ?? 1), pageSize: Number(next.pageSize ?? 25), silent: true });
       })
       .catch(() => {
-        // fallback: attempt best-effort silent load
         loadContacts({ status: params.status ?? statusQuery, page: params.page ?? pageQuery, pageSize: params.pageSize ?? pageSizeQuery, silent: true });
       });
   }
@@ -455,7 +806,6 @@ export default function CampaignInsight() {
       const body = await safeJson(res);
       if (!res.ok) throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
       loadInsight();
-      // silent contacts refresh to avoid flicker
       loadContacts({ silent: true });
     } catch (e: any) {
       alert('Retry failed: ' + (e?.message || String(e)));
@@ -492,7 +842,6 @@ export default function CampaignInsight() {
       setLastReconcileAt(new Date().toISOString());
       loadInsight();
       loadContacts({ silent: true });
-      // log
       const logEntry = { ts: new Date().toISOString(), type: 'reconcile', payload: body };
       sseLogRef.current = [logEntry, ...sseLogRef.current].slice(0, 200);
       setSseLog(sseLogRef.current);
@@ -508,7 +857,6 @@ export default function CampaignInsight() {
     if (!confirm('Force requeue of pending contacts (will attempt to enqueue pending rows up to a server limit).')) return;
     setEngineLoading(true);
     try {
-      // resume endpoint re-enqueues pending contacts in server implementation
       const res = await fetch(`/api/campaign/${id}/control`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'resume' }) });
       const body = await safeJson(res);
       if (!res.ok) throw new Error((body && (body as any).error) ? (body as any).error : JSON.stringify(body));
@@ -546,8 +894,62 @@ export default function CampaignInsight() {
     }
   }
 
+  // ---- Replies UI ----
+  async function openRepliesModalFor(row: ContactRow) {
+    setRepliesModalOpen(true);
+    setRepliesModalContact({ contactId: row.contactId, email: row.email });
+    setRepliesForContact([]);
+    setLoadingReplies(true);
+    try {
+      // Attempt multiple query strategies:
+      let url = `/api/campaign/${id}/replies?`;
+      if (row.contactId) url += `contactId=${encodeURIComponent(String(row.contactId))}`;
+      else url += `contactId=${encodeURIComponent(String(row.id))}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const body = await safeJson(res).catch(() => ({ error: 'Unknown' }));
+        throw new Error((body && (body as any).error) ? (body as any).error : `Failed to fetch replies (${res.status})`);
+      }
+      const body = await res.json();
+      const docs: ReplyDoc[] = Array.isArray(body.items) ? body.items : (Array.isArray(body) ? body : []);
+      setRepliesForContact(docs);
+    } catch (e) {
+      console.error('Failed loading replies for contact', e);
+      setRepliesForContact([]);
+      alert('Failed to load replies: ' + ((e as any).message ?? String(e)));
+    } finally {
+      setLoadingReplies(false);
+    }
+  }
+
+  function closeRepliesModal() {
+    setRepliesModalOpen(false);
+    setRepliesModalContact(null);
+    setRepliesForContact([]);
+  }
+
+  // Helper to render attachment download link; will create data URL if inline base64 provided
+  function renderAttachmentLink(att: any) {
+    const filename = att.filename || att.name || 'attachment';
+    const contentType = att.contentType || att.mimeType || 'application/octet-stream';
+    const size = att.size ? `${Math.round(att.size / 1024)} KB` : null;
+
+    if (att.content && typeof att.content === 'string') {
+      // assume base64 content
+      const href = `data:${contentType};base64,${att.content}`;
+      return (<a href={href} download={filename}>{filename}{size ? ` (${size})` : ''}</a>);
+    }
+
+    if (att.url) {
+      return (<a href={att.url} target="_blank" rel="noreferrer">{filename}{size ? ` (${size})` : ''}</a>);
+    }
+
+    // fallback: only metadata available
+    return (<span title={att.sha256 || ''}>{filename}{size ? ` (${size})` : ''}</span>);
+  }
+
   // UI render
-  const statusOptions = availableStatuses.length > 0 ? ['all', ...availableStatuses] : ['all', 'pending', 'sending', 'sent', 'failed', 'bounced', 'cancelled'];
+  const statusOptions = (availableStatuses.length > 0 ? ['all', ...availableStatuses] : ['all', 'pending', 'sending', 'sent', 'failed', 'bounced', 'cancelled']).concat(['replied', 'no_reply']);
 
   // derive top-links safe list
   const topLinks = (engagement?.links || []).map(l => ({ url: l.url || '—', clicks: l.clicks }));
@@ -561,6 +963,45 @@ export default function CampaignInsight() {
       <div style={{ marginTop: 12 }}>
         <strong>Status:</strong> {campaign?.status ?? '—'} <br />
         <strong>Created:</strong> {campaign?.createdAt ? new Date(campaign.createdAt).toLocaleString() : '—'}
+      </div>
+
+      {/* Follow-ups summary */}
+      <div style={{ marginTop: 12 }}>
+        <div style={{ border: '1px solid #eee', padding: 12, borderRadius: 6 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>Follow-up Sequence</div>
+          {followUps.length === 0 ? (
+            <div style={{ color: '#666' }}>No follow-ups configured for this campaign.</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {followUps.map((fu, idx) => (
+                <div key={idx} style={{ border: '1px solid #f0f0f0', padding: 8, borderRadius: 6, display: 'flex', gap: 12 }}>
+                  <div style={{ minWidth: 120 }}>
+                    <div style={{ fontSize: 12, color: '#666' }}>Step</div>
+                    <div style={{ fontWeight: 600 }}>{idx + 1}{fu.name ? ` — ${fu.name}` : ''}</div>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13 }}>{fu.subject ?? (fu.body ? (String(fu.body).slice(0, 120) + (String(fu.body).length > 120 ? '…' : '')) : '—')}</div>
+                    <div style={{ marginTop: 6, fontSize: 12, color: '#666' }}>
+                      Rule: {typeof fu.rule === 'string' ? fu.rule : (fu.rule?.type ?? 'always')} • Delay: {humanizeDelay(Number(fu.delayMinutes || 0))}
+                    </div>
+                    {fu.attachments && fu.attachments.length > 0 && (
+                      <div style={{ marginTop: 6 }}>
+                        <div style={{ fontSize: 12, color: '#666' }}>Attachments:</div>
+                        <ul>
+                          {fu.attachments.map((a: any, ai: number) => (
+                            <li key={ai}>
+                              {a.url ? <a href={a.url} target="_blank" rel="noreferrer">{a.name || a.filename || String(a.url)}</a> : (a.name || a.filename || 'attachment')}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
@@ -611,7 +1052,7 @@ export default function CampaignInsight() {
         </div>
       </div>
 
-      {/* Top links heatmap */}
+      {/* Top links heatmap & Delivery Engine */}
       <div style={{ marginTop: 12, display: 'flex', gap: 12 }}>
         <div style={{ flex: 1, border: '1px solid #eee', padding: 12, borderRadius: 6 }}>
           <div style={{ fontWeight: 600, marginBottom: 8 }}>Top Links</div>
@@ -633,7 +1074,6 @@ export default function CampaignInsight() {
           }
         </div>
 
-        {/* Delivery Engine */}
         <div style={{ width: 420 }}>
           <div style={{ border: '1px solid #eee', padding: 12, borderRadius: 6 }}>
             <div style={{ fontWeight: 600, marginBottom: 8 }}>Delivery Engine</div>
@@ -664,7 +1104,6 @@ export default function CampaignInsight() {
             </div>
           </div>
 
-          {/* Job / SSE Log */}
           <div style={{ marginTop: 12 }}>
             <h4 style={{ marginBottom: 8 }}>Recent job / SSE log (diagnostic)</h4>
             <div style={{ maxHeight: 240, overflow: 'auto', border: '1px solid #eee', padding: 8, borderRadius: 6, background: '#fafafa' }}>
@@ -708,7 +1147,6 @@ export default function CampaignInsight() {
           <strong>Total:</strong> {total} • <strong>Page:</strong> {pageQuery} / {pages}
         </div>
 
-        {/* Keep table present at all times to avoid layout shifts; show subtle overlay when loading */}
         <div style={{ opacity: tableLoading ? 0.6 : 1, transition: 'opacity 120ms linear' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
@@ -716,16 +1154,33 @@ export default function CampaignInsight() {
                 <th style={{ textAlign: 'left', padding: 8 }}>Email / ContactId</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Status</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Attempts</th>
+                <th style={{ textAlign: 'left', padding: 8 }}>Step</th>
+                <th style={{ textAlign: 'left', padding: 8 }}>Next follow-up</th>
+                <th style={{ textAlign: 'left', padding: 8 }}>Next FU status</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Last Attempt</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Last Known Error</th>
                 <th style={{ textAlign: 'left', padding: 8 }}>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {items.length === 0 ? <tr><td colSpan={6} style={{ padding: 12, textAlign: 'center' }}>No records</td></tr> :
+              {items.length === 0 ? <tr><td colSpan={9} style={{ padding: 12, textAlign: 'center' }}>No records</td></tr> :
                 items.map(it => {
-                  const bgDone = (typeof it.bgAttempts === 'number') ? it.bgAttempts >= maxAttempts : true;
+                  // prefer currentStepBgAttempts when available
+                  const bgDone = (typeof it.currentStepBgAttempts === 'number') ? it.currentStepBgAttempts >= maxAttempts : (typeof it.bgAttempts === 'number' ? it.bgAttempts >= maxAttempts : true);
+                  // can manual retry when status failed and attempts < maxAttempts (attempts is active step attempts)
                   const canManualRetry = it.status === 'failed' && (it.attempts < maxAttempts) && bgDone;
+
+                  const fuState = computeFollowupState(it);
+                  const nextDueStr = fuState.nextDueAt ? new Date(fuState.nextDueAt).toLocaleString() : (fuState.nextIndex === null ? '—' : 'unknown');
+
+                  // status badge for next FU
+                  let fuBadge = '';
+                  if (fuState.followupStatus === 'complete') fuBadge = 'Complete';
+                  else if (fuState.followupStatus === 'no_sequence') fuBadge = 'No sequence';
+                  else if (fuState.followupStatus === 'skipped') fuBadge = `Skipped${fuState.skipReason ? ` (${fuState.skipReason})` : ''}`;
+                  else if (fuState.followupStatus === 'scheduled') fuBadge = `Scheduled • ${nextDueStr}`;
+                  else if (fuState.followupStatus === 'due') fuBadge = 'Due';
+                  else fuBadge = '—';
 
                   return (
                     <tr key={it.id} style={{ borderBottom: '1px solid #eee' }}>
@@ -734,9 +1189,17 @@ export default function CampaignInsight() {
                           <div style={{ minWidth: 320, overflow: 'hidden' }}>
                             <div style={{ fontSize: 14, fontWeight: 500 }}>{it.email ?? it.contactId ?? '—'}</div>
                             <div style={{ fontSize: 12, color: '#666' }}>{it.contactId ?? ''}</div>
+                            {it.replied && (
+                              <div style={{ marginTop: 6 }}>
+                                <span style={{ background: '#fff7e6', color: '#a66f00', padding: '4px 8px', borderRadius: 999, fontSize: 12 }}>Replied</span>
+                                {it.repliesCount ? <span style={{ marginLeft: 8, fontSize: 12, color: '#666' }}>{it.repliesCount} reply(ies)</span> : null}
+                                {it.lastReplyAt ? <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Last reply: {new Date(it.lastReplyAt).toLocaleString()}</div> : null}
+                                {it.lastReplySnippet ? <div style={{ marginTop: 6, fontSize: 13, color: '#333' }}>{String(it.lastReplySnippet).slice(0, 200)}{String(it.lastReplySnippet).length > 200 ? '…' : ''}</div> : null}
+                              </div>
+                            )}
                           </div>
 
-                          <div style={{ display: 'flex', gap: 6 }}>
+                          <div style={{ display: 'flex', gap: 6, flexDirection: 'column' }}>
                             {it.opened ? (
                               <div title={it.lastOpenAt ? `Opened: ${new Date(it.lastOpenAt).toLocaleString()}` : 'Opened'} style={{ background: '#e6ffed', color: '#0f8a3f', padding: '4px 8px', borderRadius: 999, fontSize: 12 }}>Opened</div>
                             ) : null}
@@ -748,13 +1211,44 @@ export default function CampaignInsight() {
                       </td>
                       <td style={{ padding: 8 }}>{it.status ?? '—'}</td>
                       <td style={{ padding: 8 }}>
-                        {it.attempts} / {maxAttempts}
-                        {typeof it.bgAttempts === 'number' ? <div style={{ fontSize: 11, color: '#666' }}>bg: {it.bgAttempts} / {maxAttempts}</div> : null}
+                        <div>{it.attempts} / {maxAttempts}</div>
+                        {(typeof it.currentStepAttempts === 'number' || typeof it.currentStepBgAttempts === 'number') && (
+                          <div style={{ fontSize: 11, color: '#666' }}>
+                            {typeof it.currentStepAttempts === 'number' ? `step: ${it.currentStepAttempts}` : null}
+                            {typeof it.currentStepBgAttempts === 'number' ? <span style={{ marginLeft: 8 }}>bg: {it.currentStepBgAttempts}</span> : null}
+                          </div>
+                        )}
+                        {typeof it.bgAttempts === 'number' && (typeof it.currentStepBgAttempts !== 'number') ? <div style={{ fontSize: 11, color: '#666' }}>bg: {it.bgAttempts}</div> : null}
                       </td>
+
+                      <td style={{ padding: 8 }}>
+                        <div style={{ fontSize: 13 }}>{fuState.lastSentLabel}</div>
+                        {it.currentStepName ? <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Active: {it.currentStepName} (index {it.currentStepIndex ?? '—'})</div> : null}
+                      </td>
+
+                      <td style={{ padding: 8 }}>
+                        <div style={{ fontSize: 13 }}>{fuState.nextStepLabel}</div>
+                        {fuState.nextIndex !== null && followUps[fuState.nextIndex] && (
+                          <div style={{ marginTop: 6, fontSize: 12, color: '#666' }}>
+                            Delay: {humanizeDelay(Number(followUps[fuState.nextIndex].delayMinutes || 0))}
+                            {fuState.nextRule ? <span style={{ marginLeft: 8 }}>Rule: {fuState.nextRule}</span> : null}
+                          </div>
+                        )}
+                      </td>
+
+                      <td style={{ padding: 8 }}>
+                        <div style={{ fontSize: 13 }}>{fuBadge}</div>
+                        {fuState.followupStatus === 'scheduled' && fuState.nextDueAt ? <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Due: {new Date(fuState.nextDueAt).toLocaleString()}</div> : null}
+                        {it.nextFollowUpAt && !fuState.nextDueAt ? <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Next: {new Date(it.nextFollowUpAt).toLocaleString()}</div> : null}
+                      </td>
+
                       <td style={{ padding: 8 }}>{it.lastAttemptAt ? new Date(it.lastAttemptAt).toLocaleString() : '—'}</td>
                       <td style={{ padding: 8, color: 'red' }}>{it.lastError ?? '—'}</td>
                       <td style={{ padding: 8 }}>
-                        <button disabled={actionInProgress || !canManualRetry} onClick={() => retryContact(it.contactId)} title={!canManualRetry ? (it.attempts >= maxAttempts ? 'Reached max attempts' : 'Background retries in progress or not failed') : 'Retry this contact'}>Retry</button>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <button disabled={actionInProgress || !canManualRetry} onClick={() => retryContact(it.contactId)} title={!canManualRetry ? (it.attempts >= maxAttempts ? 'Reached max attempts' : 'Background retries in progress or not failed') : 'Retry this contact'}>Retry</button>
+                          <button onClick={() => openRepliesModalFor(it)} title="View replies for this contact">View replies</button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -785,6 +1279,64 @@ export default function CampaignInsight() {
           <button onClick={() => updateQuery({ page: Math.min(pages, pageQuery + 1) })} disabled={pageQuery >= pages}>Next</button>
         </div>
       </div>
+
+      {/* Replies modal */}
+      {repliesModalOpen && (
+        <div style={{
+          position: 'fixed', left: 0, right: 0, top: 0, bottom: 0, background: 'rgba(0,0,0,0.4)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000
+        }}>
+          <div style={{ width: '90%', maxWidth: 900, maxHeight: '90%', overflow: 'auto', background: '#fff', borderRadius: 8, padding: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <strong>Replies for</strong>
+                <div style={{ fontSize: 13, color: '#666' }}>{repliesModalContact?.email ?? repliesModalContact?.contactId ?? '—'}</div>
+              </div>
+              <div>
+                <button onClick={closeRepliesModal}>Close</button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              {loadingReplies ? <div>Loading replies…</div> : (
+                repliesForContact.length === 0 ? <div style={{ color: '#666' }}>No replies found.</div> :
+                  repliesForContact.map((r, idx) => (
+                    <div key={r._id ?? r.fingerprint ?? idx} style={{ border: '1px solid #eee', padding: 12, borderRadius: 6, marginBottom: 12 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <div>
+                          <div style={{ fontWeight: 600 }}>{r.subject ?? '(no subject)'}</div>
+                          <div style={{ fontSize: 12, color: '#666' }}>{r.from} • {r.receivedAt ? new Date(r.receivedAt).toLocaleString() : ''}</div>
+                        </div>
+                        <div style={{ fontSize: 12, color: '#666' }}>{r.source ?? ''}</div>
+                      </div>
+
+                      {r.text ? (
+                        <div style={{ marginTop: 8, whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 13 }}>{r.text}</div>
+                      ) : r.html ? (
+                        <div style={{ marginTop: 8 }}>
+                          <div dangerouslySetInnerHTML={{ __html: r.html ?? '' }} />
+                        </div>
+                      ) : null}
+
+                      {r.attachments && r.attachments.length > 0 && (
+                        <div style={{ marginTop: 8 }}>
+                          <div style={{ fontWeight: 600 }}>Attachments</div>
+                          <ul>
+                            {r.attachments.map((a, ai) => (
+                              <li key={ai}>
+                                {renderAttachmentLink(a)}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

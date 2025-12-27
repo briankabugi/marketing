@@ -1,3 +1,5 @@
+
+// workers/campaignWorker.ts
 import 'dotenv/config'; // critical
 import { Worker, Queue, Job } from 'bullmq';
 import { redis } from '../lib/redis';
@@ -7,6 +9,8 @@ import { ObjectId } from 'mongodb';
 import fs from 'fs/promises';
 import path from 'path';
 import { URL } from 'url';
+import { hasReplyForCampaignContact } from '../lib/replies';
+import crypto from 'crypto';
 
 const queue = new Queue('campaigns', { connection: redis });
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 3);
@@ -41,6 +45,21 @@ const transporter = nodemailer.createTransport({
     pass: process.env.ZOHO_PASS,
   },
 });
+
+// -----------------
+// NOTE: Use ZOHO_USER for reply-to plus-addressing (single mailbox).
+// Example Reply-To: sales+{campaignId}+{contactId}@yourdomain.com
+// -----------------
+const ZOHO_USER = process.env.ZOHO_USER || '';
+if (!ZOHO_USER || !ZOHO_USER.includes('@')) {
+  console.warn('Warning: ZOHO_USER not set or invalid. Reply-To generation may be disabled.');
+}
+
+// Inbound attachment storage controls:
+// INBOUND_STORE_ATTACHMENTS=true  -> store attachment content as base64 string in replies collection.
+// INBOUND_ATTACHMENT_MAX_BYTES=5242880 -> max bytes allowed to store inline (default 5MB).
+const INBOUND_STORE_ATTACHMENTS = (process.env.INBOUND_STORE_ATTACHMENTS || 'false').toLowerCase() === 'true';
+const INBOUND_ATTACHMENT_MAX_BYTES = Number(process.env.INBOUND_ATTACHMENT_MAX_BYTES || 5 * 1024 * 1024);
 
 // exponential backoff utility
 function computeRetryDelay(attempts: number) {
@@ -237,10 +256,12 @@ async function computeCampaignTotals(db: any, campaignIdStr: string, campaignObj
   try {
     const agg = await db.collection('campaign_contacts').aggregate([
       { $match: { campaignId: campaignObjId } },
-      { $group: {
-        _id: '$status',
-        count: { $sum: 1 },
-      } },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+        }
+      },
     ]).toArray();
 
     let sent = 0, failed = 0, pending = 0;
@@ -316,7 +337,7 @@ async function finalizeCampaign(campaignIdStr: string) {
           failed: String(failed),
           total: String(total),
         });
-      } catch (e) {}
+      } catch (e) { }
     }
   } catch (e) {
     console.warn('finalizeCampaign error', e);
@@ -619,17 +640,225 @@ function htmlToPlainText(html: string) {
 }
 
 // ---------------------
+// Small helpers for plan normalization
+// ---------------------
+function normalizeIndex(v: any): number | null {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeDate(val: any): Date | null {
+  if (!val) return null;
+  if (val instanceof Date) return val;
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// ---------------------
 // Worker logic
 // ---------------------
-
 const worker = new Worker(
   'campaigns',
   async (job: Job) => {
-    const { campaignId, contactId, step } = job.data as { campaignId: string; contactId?: string; step?: any };
+    const jobName = job.name;
+    const { campaignId, contactId } = job.data as { campaignId: string; contactId?: string; [k: string]: any };
+    // step may be present (legacy) or stepIndex may be present (new)
+    const providedStep = (job.data as any).step;
+    const providedStepIndex = (job.data as any).stepIndex;
+
     if (!campaignId || !contactId) {
       console.warn('Job missing campaignId or contactId', job.id);
       return;
     }
+
+    // ---- NEW: handle evaluate_followup jobs ----
+    if (jobName === 'evaluate_followup') {
+      try {
+        const stepIndex = providedStepIndex ?? providedStep?.index ?? providedStep?.stepIndex ?? providedStep?.i ?? null;
+        const idx = normalizeIndex(stepIndex);
+
+        const client = await clientPromise;
+        const db = client.db('PlatformData');
+
+        const ledgerFilter = { campaignId: tryParseObjectId(campaignId), contactId: tryParseObjectId(contactId) };
+
+        // fetch ledger row to read followUpPlan
+        const ledger = await db.collection('campaign_contacts').findOne(ledgerFilter);
+
+        if (!ledger) {
+          console.warn('evaluate_followup: no ledger row found', campaignId, contactId);
+          return;
+        }
+
+        const plan = Array.isArray(ledger.followUpPlan) ? ledger.followUpPlan : [];
+
+        // find follow-up step from ledger plan (prefer ledger-stored plan so we preserve per-contact schedule)
+        const planStep = (idx != null) ? plan.find((s: any) => normalizeIndex(s.index) === idx) : (providedStep ?? null);
+
+        if (!planStep) {
+          console.debug('evaluate_followup: no matching plan step found; skipping', { campaignId, contactId, stepIndex: idx });
+          return;
+        }
+
+        // rule can be: { type: 'always'|'no_reply'|'replied' } OR a simple string
+        const ruleObj = typeof planStep?.rule === 'string' ? { type: planStep.rule } : (planStep?.rule ?? { type: 'always' });
+        const ruleType = ruleObj.type || 'always';
+
+        // If rule is reply-based, query replies collection
+        let replied = false;
+        try {
+          if (ruleType === 'no_reply' || ruleType === 'replied') {
+            replied = await hasReplyForCampaignContact(campaignId, contactId);
+          }
+        } catch (e) {
+          // On DB error, be conservative and allow followup (so we don't silently drop followups).
+          console.warn('evaluate_followup: reply check failed, allowing followup by default', e);
+          replied = false;
+        }
+
+        let shouldSend = false;
+        if (ruleType === 'always') shouldSend = true;
+        else if (ruleType === 'no_reply') shouldSend = !replied;
+        else if (ruleType === 'replied') shouldSend = replied;
+        else {
+          // Unknown rule, default to sending (safer)
+          shouldSend = true;
+        }
+
+        if (shouldSend) {
+          // Enqueue actual followup send (preserve attempts/backoff settings)
+          try {
+            // enqueue followup job with stepIndex to be deterministic
+            const enqueuePayload: any = { campaignId, contactId };
+            if (idx != null) enqueuePayload.stepIndex = idx;
+            else if (planStep?.index) enqueuePayload.stepIndex = normalizeIndex(planStep.index);
+
+            await queue.add(
+              'followup',
+              enqueuePayload,
+              { removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
+            );
+
+            // robustly update the per-contact plan entry (read-modify-write)
+            try {
+              const scheduledForCandidate = planStep?.scheduledFor ?? planStep?.scheduledAt ?? planStep?.scheduled ?? null;
+              const scheduledForVal = normalizeDate(scheduledForCandidate) ?? null;
+
+              // mutate local copy
+              const newPlan = Array.isArray(plan) ? plan.map((p: any) => ({ ...p })) : [];
+              const pIdx = newPlan.findIndex((p: any) => normalizeIndex(p.index) === (enqueuePayload.stepIndex ?? null));
+              if (pIdx !== -1) {
+                newPlan[pIdx].status = 'scheduled';
+                if (scheduledForVal) newPlan[pIdx].scheduledFor = scheduledForVal;
+              } else if (enqueuePayload.stepIndex != null) {
+                // if the plan doesn't contain it for some reason, append a normalized entry
+                newPlan.push({
+                  index: enqueuePayload.stepIndex,
+                  name: planStep?.name ?? `Follow up ${enqueuePayload.stepIndex}`,
+                  rule: planStep?.rule ?? 'always',
+                  status: 'scheduled',
+                  scheduledFor: scheduledForVal,
+                });
+              }
+
+              // compute nextFollowUpAt and followUpStatus from newPlan
+              const sorted = newPlan.slice().sort((a: any, b: any) => (normalizeIndex(a.index) ?? 0) - (normalizeIndex(b.index) ?? 0));
+              const next = sorted.find((p: any) => normalizeIndex(p.index) > normalizeIndex(enqueuePayload.stepIndex) && (p.status === 'scheduled' || !p.status));
+              const nextAt = next ? (normalizeDate(next.scheduledFor) ?? null) : null;
+              const followUpStatus = newPlan.some((p: any) => p.status === 'scheduled') ? 'scheduled' : 'done';
+
+              await db.collection('campaign_contacts').updateOne(
+                ledgerFilter,
+                {
+                  $set: {
+                    followUpPlan: newPlan,
+                    nextFollowUpAt: nextAt,
+                    followUpStatus,
+                  }
+                }
+              );
+
+              // publish contact update with scheduling detail
+              await publishContactUpdate(campaignId, contactId, {
+                scheduledStepIndex: enqueuePayload.stepIndex ?? null,
+                scheduledStepName: planStep?.name ?? null,
+                nextFollowUpAt: nextAt ? new Date(nextAt).toISOString() : null,
+                followUpStatus,
+              });
+            } catch (e) {
+              console.warn('evaluate_followup: failed to persist scheduled plan step via read-modify-write', e);
+            }
+
+          } catch (e) {
+            console.warn('evaluate_followup: failed to enqueue followup send', e);
+          }
+        } else {
+          // persist a campaign_events row so UI/API can aggregate it later (followup skipped)
+          try {
+            const now = new Date();
+            try {
+              await db.collection('campaign_events').insertOne({
+                campaignId,
+                contactId,
+                type: 'followup_skipped',
+                stepName: planStep?.name ?? null,
+                stepIndex: normalizeIndex(planStep?.index) ?? null,
+                rule: ruleType,
+                skippedReason: `rule:${ruleType}`,
+                createdAt: now,
+                via: 'worker',
+              });
+            } catch (e) {
+              console.warn('Failed to persist followup_skipped event', e);
+            }
+
+            // update ledger plan element to skipped via read-modify-write
+            try {
+              const newPlan = Array.isArray(plan) ? plan.map((p: any) => ({ ...p })) : [];
+              const pIdx = newPlan.findIndex((p: any) => normalizeIndex(p.index) === normalizeIndex(planStep?.index));
+              if (pIdx !== -1) {
+                newPlan[pIdx].status = 'skipped';
+                newPlan[pIdx].skippedAt = new Date();
+                newPlan[pIdx].skippedReason = ruleType;
+              }
+
+              // compute nextFollowUpAt (next scheduled step that is still 'scheduled')
+              const sorted = newPlan.slice().sort((a: any, b: any) => (normalizeIndex(a.index) ?? 0) - (normalizeIndex(b.index) ?? 0));
+              const next = sorted.find((p: any) => normalizeIndex(p.index) > normalizeIndex(planStep?.index) && p.status === 'scheduled');
+              const nextAt = next ? (normalizeDate(next.scheduledFor) ?? null) : null;
+              const followUpStatus = newPlan.some((p: any) => p.status === 'scheduled') ? 'scheduled' : 'done';
+
+              await db.collection('campaign_contacts').updateOne(ledgerFilter, {
+                $set: {
+                  followUpPlan: newPlan,
+                  nextFollowUpAt: nextAt,
+                  followUpStatus,
+                }
+              });
+
+              // publish contact update with skipped info and progression fields
+              await publishContactUpdate(campaignId, contactId, {
+                followupSkipped: true,
+                skippedReason: `rule:${ruleType}`,
+                skippedAt: new Date().toISOString(),
+                stepName: planStep?.name ?? null,
+                nextFollowUpAt: nextAt ? new Date(nextAt).toISOString() : null,
+                followUpStatus,
+              });
+            } catch (e) {
+              console.warn('evaluate_followup: failed updating ledger for skipped step', e);
+            }
+          } catch (e) {
+            console.warn('evaluate_followup: could not persist followup_skipped (db error)', e);
+          }
+        }
+      } catch (e) {
+        console.warn('evaluate_followup job failed', e);
+      }
+      return;
+    }
+    // ---- END evaluate_followup handler ----
 
     const jobAttemptsMade = typeof (job.attemptsMade) === 'number' ? job.attemptsMade : 0;
     const bgAttemptNumber = jobAttemptsMade + 1;
@@ -666,8 +895,8 @@ const worker = new Worker(
           lastAttemptAt: new Date(),
           lastError: 'missing ledger row',
         });
-      } catch (e) {}
-      try { await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1); await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1); } catch (_) {}
+      } catch (e) { }
+      try { await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1); await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1); } catch (_) { }
       await publishContactUpdate(campaignId, contactId, { status: 'failed', attempts: 0, bgAttempts: 0, lastAttemptAt: new Date().toISOString(), lastError: 'missing ledger row' });
       await finalizeCampaign(campaignId);
       return;
@@ -684,7 +913,7 @@ const worker = new Worker(
       } catch (e) {
         console.warn('Failed to mark missing contact/email in ledger', e);
       }
-      try { await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1); await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1); } catch (_) {}
+      try { await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1); await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1); } catch (_) { }
       await publishContactUpdate(campaignId, contactId, { status: 'failed', attempts: ledgerRow.attempts ?? 0, bgAttempts: bgAttemptNumber, lastAttemptAt: new Date().toISOString(), lastError: 'missing contact or email' });
       await finalizeCampaign(campaignId);
       return;
@@ -692,8 +921,8 @@ const worker = new Worker(
 
     const domain = (contact.email.split('@')[1] || '').toLowerCase();
 
-    // mark initial core attempts if needed
-    if (bgAttemptNumber === 1 && !(ledgerRow.attempts && ledgerRow.attempts > 0)) {
+    // mark initial core attempts if needed (only for initial send)
+    if (jobName === 'initial' && bgAttemptNumber === 1 && !(ledgerRow.attempts && ledgerRow.attempts > 0)) {
       try {
         await db.collection('campaign_contacts').updateOne(ledgerFilter, { $set: { attempts: 1 } });
       } catch (e) {
@@ -746,9 +975,24 @@ const worker = new Worker(
       throw new Error('Missing campaign definition');
     }
     const definition = JSON.parse(defRaw);
-    const isInitial = job.name === 'initial';
-    const subject = isInitial ? definition.initial?.subject : (step?.subject || definition.initial?.subject);
-    const body = isInitial ? definition.initial?.body : (step?.body || definition.initial?.body);
+
+    // Decide whether this job is initial or followup
+    const isInitial = jobName === 'initial';
+    const isFollowup = jobName === 'followup';
+
+    // resolve stepIndex (for followups) and stepDef (definition-based)
+    const stepIndex = isFollowup ? (providedStepIndex ?? providedStep?.index ?? providedStep?.stepIndex ?? null) : null;
+    const idx = normalizeIndex(stepIndex);
+    let stepDef: any = null;
+    if (isFollowup && idx != null) {
+      // try to pick from in-memory providedStep or campaign definition
+      stepDef = providedStep ?? (Array.isArray(definition.followUps) ? definition.followUps[Number(idx) - 1] : undefined);
+    } else if (!isFollowup) {
+      stepDef = null;
+    }
+
+    const subject = isInitial ? definition.initial?.subject : (stepDef?.subject || definition.initial?.subject);
+    const body = isInitial ? definition.initial?.body : (stepDef?.body || definition.initial?.body);
 
     // Prepare tracked HTML (auto-link plain URLs -> rewrite links -> inject pixel) and attachments
     let trackedHtml = body;
@@ -758,9 +1002,10 @@ const worker = new Worker(
         trackedHtml = autoLinkPlainTextUrls(trackedHtml);
 
         // 2) rewrite hrefs to tracking endpoint (normalizes missing scheme)
-        trackedHtml = rewriteLinksForTracking(trackedHtml, campaignId, contactId);
+        const contactIdStr = String(contactId);
+        trackedHtml = rewriteLinksForTracking(trackedHtml, campaignId, contactIdStr);
 
-        // 3) inject open pixel
+        // 3) inject open pixel (optional; commented out originally)
         // trackedHtml = injectOpenPixel(trackedHtml, campaignId, contactId);
       }
     } catch (e) {
@@ -771,36 +1016,65 @@ const worker = new Worker(
     // Build attachments from definition (best-effort)
     let attachments: any[] = [];
     try {
-      const defPart = isInitial ? definition.initial : step ?? definition.initial;
+      const defPart = isInitial ? definition.initial : (stepDef ?? definition.initial);
       attachments = await buildAttachments(defPart);
     } catch (e) {
       console.warn('Failed to build attachments', e);
       attachments = [];
     }
 
-    // mark sending & bgAttempts
+    // --------- NEW: compute and persist step-scoped attempt counters before send ----------
     try {
-      await db.collection('campaign_contacts').updateOne(
-        ledgerFilter,
-        {
-          $set: {
-            bgAttempts: bgAttemptNumber,
-            status: 'sending',
-            lastAttemptAt: new Date(),
-            lastError: null,
-          },
-        }
-      );
-
-      await publishContactUpdate(campaignId, contactId, {
-        status: 'sending',
-        attempts: ledgerRow.attempts ?? 0,
+      // We'll set bgAttempts (global), and for followups also set per-step attempts/bgAttempts and make `attempts` mirror currentStepAttempts.
+      const now = new Date();
+      const updateSet: any = {
         bgAttempts: bgAttemptNumber,
-        lastAttemptAt: new Date().toISOString(),
+        status: 'sending',
+        lastAttemptAt: now,
         lastError: null,
-      });
+      };
+
+      if (isFollowup && idx != null) {
+        // Determine whether ledgerRow already points to this step
+        const ledgerCurrentIdx = normalizeIndex(ledgerRow.currentStepIndex);
+        const prevStepAttempts = typeof ledgerRow.currentStepAttempts === 'number' ? ledgerRow.currentStepAttempts : 0;
+        const nextStepAttempts = (ledgerCurrentIdx === idx) ? (prevStepAttempts + 1) : 1;
+
+        updateSet.currentStepIndex = idx;
+        updateSet.currentStepName = stepDef?.name ?? ledgerRow.currentStepName ?? `Follow up ${idx}`;
+        updateSet.currentStepAttempts = nextStepAttempts;
+        updateSet.currentStepBgAttempts = bgAttemptNumber;
+        // Mirror attempts shown in UI to the active step attempts
+        updateSet.attempts = nextStepAttempts;
+      } else {
+        // For initial sends, keep attempts as-is (initial logic earlier may have set attempts=1)
+        // Do not override `attempts` for non-followup unless it was missing and this is first attempt (handled earlier)
+      }
+
+      await db.collection('campaign_contacts').updateOne(ledgerFilter, { $set: updateSet });
+
+      // Publish sending update including step-scoped fields (so UI updates step/attempts immediately)
+      const publishPayload: any = {
+        status: 'sending',
+        attempts: updateSet.attempts ?? ledgerRow.attempts ?? 0,
+        bgAttempts: bgAttemptNumber,
+        lastAttemptAt: now.toISOString(),
+        lastError: null,
+      };
+      if (isFollowup && idx != null) {
+        publishPayload.currentStepIndex = updateSet.currentStepIndex;
+        publishPayload.currentStepName = updateSet.currentStepName;
+        publishPayload.currentStepAttempts = updateSet.currentStepAttempts;
+        publishPayload.currentStepBgAttempts = updateSet.currentStepBgAttempts;
+      } else {
+        // ensure initial step is visible if present
+        publishPayload.currentStepIndex = ledgerRow.currentStepIndex ?? 0;
+        publishPayload.currentStepName = ledgerRow.currentStepName ?? (isInitial ? 'initial' : null);
+      }
+
+      await publishContactUpdate(campaignId, contactId, publishPayload);
     } catch (e) {
-      console.warn('Failed to mark sending/publish update', e);
+      console.warn('Failed to mark sending/publish step-scoped update', e);
     }
 
     // Attempt to send
@@ -821,18 +1095,19 @@ const worker = new Worker(
         // ignore
       }
 
-      // // Add List-Unsubscribe header when public base url is set (helps deliverability)
-      // if (PUBLIC_BASE_URL) {
-      //   try {
-      //     const unsubscribeUrl = `${PUBLIC_BASE_URL}/unsubscribe?c=${encodeURIComponent(campaignId)}&k=${encodeURIComponent(contactId)}`;
-      //     mailOptions.headers = {
-      //       ...(mailOptions.headers || {}),
-      //       'List-Unsubscribe': `<${unsubscribeUrl}>`,
-      //     };
-      //   } catch (e) {
-      //     // ignore header errors
-      //   }
-      // }
+      // --- Reply-To: plus-addressed ZOHO_USER (single inbox) ---
+      try {
+        if (ZOHO_USER && ZOHO_USER.includes('@')) {
+          const [local, domainPart] = String(ZOHO_USER).split('@');
+          const safeCampaign = encodeURIComponent(String(campaignId));
+          const safeContact = encodeURIComponent(String(contactId));
+          mailOptions.replyTo = `${local}+${safeCampaign}+${safeContact}@${domainPart}`;
+        } else {
+          console.warn('ZOHO_USER missing or invalid; not setting Reply-To header');
+        }
+      } catch (e) {
+        console.warn('Failed to set replyTo header', e);
+      }
 
       if (attachments && attachments.length) {
         mailOptions.attachments = attachments.map(a => {
@@ -845,12 +1120,29 @@ const worker = new Worker(
 
       await transporter.sendMail(mailOptions);
 
+      // Successful send handling
       try {
+        const now = new Date();
+        // Update ledger: set status 'sent' and lastAttemptAt/bgAttempts; keep currentStepAttempts intact
+        const setObj: any = {
+          status: 'sent',
+          lastAttemptAt: now,
+          bgAttempts: bgAttemptNumber,
+        };
+
+        // If followup: ensure currentStepBgAttempts is recorded (db was set earlier but write again for safety)
+        if (isFollowup && idx != null) {
+          // read ledger fresh to get currentStepAttempts if present
+          const ledgerFresh = await db.collection('campaign_contacts').findOne(ledgerFilter);
+          setObj.currentStepAttempts = ledgerFresh?.currentStepAttempts ?? (ledgerRow.currentStepAttempts ?? 1);
+          setObj.currentStepBgAttempts = bgAttemptNumber;
+          // mirror attempts shown in UI
+          setObj.attempts = setObj.currentStepAttempts;
+        }
+
         await db.collection('campaign_contacts').updateOne(
           ledgerFilter,
-          {
-            $set: { status: 'sent', lastAttemptAt: new Date(), bgAttempts: bgAttemptNumber },
-          }
+          { $set: setObj }
         );
       } catch (e) {
         console.warn('Failed to update ledger on success', e);
@@ -861,29 +1153,184 @@ const worker = new Worker(
       try {
         await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
         await redis.hincrby(`campaign:${campaignId}:meta`, 'sent', 1);
-      } catch (e) {}
+      } catch (e) { }
 
-      await publishContactUpdate(campaignId, contactId, {
-        status: 'sent',
-        attempts: (ledgerRow.attempts ?? 0),
-        bgAttempts: bgAttemptNumber,
-        lastAttemptAt: new Date().toISOString(),
-        lastError: null,
-      });
+      // publish basic sent update with step-scoped fields
+      try {
+        const ledgerAfter = await db.collection('campaign_contacts').findOne(ledgerFilter);
+        const publishPayload: any = {
+          status: 'sent',
+          attempts: ledgerAfter?.attempts ?? 0,
+          bgAttempts: ledgerAfter?.bgAttempts ?? 0,
+          lastAttemptAt: ledgerAfter?.lastAttemptAt ? new Date(ledgerAfter.lastAttemptAt).toISOString() : new Date().toISOString(),
+          lastError: null,
+        };
+        if (isFollowup && idx != null) {
+          publishPayload.currentStepIndex = ledgerAfter?.currentStepIndex ?? idx;
+          publishPayload.currentStepName = ledgerAfter?.currentStepName ?? (stepDef?.name ?? `Follow up ${idx}`);
+          publishPayload.currentStepAttempts = ledgerAfter?.currentStepAttempts ?? 1;
+          publishPayload.currentStepBgAttempts = ledgerAfter?.currentStepBgAttempts ?? bgAttemptNumber;
+        } else {
+          publishPayload.currentStepIndex = ledgerAfter?.currentStepIndex ?? 0;
+          publishPayload.currentStepName = ledgerAfter?.currentStepName ?? (isInitial ? 'initial' : null);
+        }
+        await publishContactUpdate(campaignId, contactId, publishPayload);
+      } catch (e) {
+        console.warn('Failed to publish post-send contact update', e);
+      }
 
-      // schedule follow-ups if initial
-      if (isInitial) {
-        for (const followUp of (definition.followUps || []) as any[]) {
-          if (!followUp || !followUp.delayMinutes) continue;
+      // Persist followup_sent event for follow-up sends (not the initial send)
+      try {
+        if (!isInitial && stepDef) {
           try {
-            await queue.add(
-              'followup',
-              { campaignId, contactId, step: followUp },
-              { delay: followUp.delayMinutes * 60 * 1000, removeOnComplete: true, removeOnFail: true, attempts: MAX_ATTEMPTS, backoff: { type: 'exponential', delay: 60_000 } }
-            );
+            await db.collection('campaign_events').insertOne({
+              campaignId,
+              contactId,
+              type: 'followup_sent',
+              stepName: stepDef?.name ?? null,
+              stepIndex: Number(idx ?? (stepDef?.index ?? null)),
+              createdAt: new Date(),
+              via: 'worker',
+            });
           } catch (e) {
-            console.warn('Failed to enqueue followup', e);
+            console.warn('Failed to persist followup_sent event', e);
           }
+        }
+      } catch (e) {
+        // non-fatal
+      }
+
+      // ----- NEW: when initial is sent, persist per-contact followUpPlan and schedule evaluate jobs -----
+      if (isInitial) {
+        try {
+          const now = new Date();
+          const followUps = Array.isArray(definition.followUps) ? definition.followUps : [];
+          const plan = followUps.map((f: any, i: number) => {
+            const index = i + 1;
+            const name = f.name || `Follow up ${index}`;
+            const delayMinutes = Number(f.delayMinutes || 0);
+            const scheduledFor = new Date(now.getTime() + (delayMinutes * 60 * 1000));
+            return {
+              index,
+              name,
+              delayMinutes,
+              rule: f.rule ?? 'always',
+              status: 'scheduled',
+              scheduledFor,
+            };
+          });
+
+          const nextFollowUpAt = plan[0] ? plan[0].scheduledFor : null;
+          const followUpStatus = plan.length ? 'scheduled' : 'done';
+
+          await db.collection('campaign_contacts').updateOne(
+            ledgerFilter,
+            {
+              $set: {
+                currentStepIndex: 0,
+                currentStepName: 'initial',
+                followUpPlan: plan,
+                nextFollowUpAt,
+                followUpStatus,
+                lastStepSentAt: now,
+              }
+            }
+          );
+
+          // enqueue evaluate_followup jobs using stepIndex (durable schedule)
+          for (const p of plan) {
+            try {
+              await queue.add(
+                'evaluate_followup',
+                { campaignId, contactId, stepIndex: p.index },
+                { delay: p.delayMinutes * 60 * 1000, removeOnComplete: true, removeOnFail: true, attempts: 1 }
+              );
+            } catch (e) {
+              console.warn('Failed to enqueue evaluate_followup (initial scheduling)', e);
+            }
+          }
+
+          // publish updated progression state
+          await publishContactUpdate(campaignId, contactId, {
+            currentStepIndex: 0,
+            currentStepName: 'initial',
+            nextFollowUpAt: nextFollowUpAt ? new Date(nextFollowUpAt).toISOString() : null,
+            followUpStatus,
+            followUpPlanCount: plan.length,
+            lastStepSentAt: new Date().toISOString(),
+          });
+        } catch (e) {
+          console.warn('Failed to persist followUpPlan after initial send', e);
+        }
+      }
+
+      // ----- NEW: when a follow-up is sent, update per-contact progression state robustly -----
+      if (!isInitial && isFollowup) {
+        try {
+          const sentIdx = idx;
+          const now = new Date();
+
+          // Read ledger again to operate on canonical plan
+          const ledgerFresh = await db.collection('campaign_contacts').findOne(ledgerFilter);
+          const plan = Array.isArray(ledgerFresh?.followUpPlan) ? ledgerFresh.followUpPlan.map((p: any) => ({ ...p })) : [];
+
+          // find the plan entry by normalized index
+          const pIdx = plan.findIndex((p: any) => normalizeIndex(p.index) === sentIdx);
+
+          if (pIdx !== -1) {
+            plan[pIdx].status = 'sent';
+            plan[pIdx].sentAt = now;
+          } else {
+            // Plan entry missing: append a minimal record so UI can reflect it
+            plan.push({
+              index: sentIdx,
+              name: stepDef?.name ?? `Follow up ${sentIdx}`,
+              rule: stepDef?.rule ?? 'always',
+              status: 'sent',
+              sentAt: now,
+            });
+          }
+
+          // compute next scheduled follow-up (that is still 'scheduled')
+          const sorted = plan.slice().sort((a: any, b: any) => (normalizeIndex(a.index) ?? 0) - (normalizeIndex(b.index) ?? 0));
+          const next = sorted.find((p: any) => normalizeIndex(p.index) > (sentIdx ?? 0) && (p.status === 'scheduled' || !p.status));
+          const nextAt = next ? (normalizeDate(next.scheduledFor) ?? null) : null;
+          const followUpStatus = sorted.some((p: any) => p.status === 'scheduled') ? 'scheduled' : 'done';
+          const currentStepName = stepDef?.name ?? (pIdx !== -1 ? (plan[pIdx]?.name ?? `Follow up ${sentIdx}`) : `Follow up ${sentIdx}`);
+
+          // choose currentStepAttempts/currentStepBgAttempts from ledgerFresh if present
+          const curStepAttempts = ledgerFresh?.currentStepAttempts ?? 1;
+          const curStepBgAttempts = ledgerFresh?.currentStepBgAttempts ?? bgAttemptNumber;
+
+          // Write entire mutated plan + progression fields atomically
+          await db.collection('campaign_contacts').updateOne(ledgerFilter, {
+            $set: {
+              followUpPlan: plan,
+              currentStepIndex: sentIdx,
+              currentStepName,
+              currentStepAttempts: curStepAttempts,
+              currentStepBgAttempts: curStepBgAttempts,
+              lastStepSentAt: now,
+              nextFollowUpAt: nextAt,
+              followUpStatus,
+              // Mirror attempts to attempts field so UI's legacy 'attempts' column shows step attempts
+              attempts: curStepAttempts,
+            }
+          });
+
+          // Publish accurate progression state to UI
+          await publishContactUpdate(campaignId, contactId, {
+            currentStepIndex: sentIdx,
+            currentStepName,
+            currentStepAttempts: curStepAttempts,
+            currentStepBgAttempts: curStepBgAttempts,
+            lastStepSentAt: now.toISOString(),
+            nextFollowUpAt: nextAt ? new Date(nextAt).toISOString() : null,
+            followUpStatus,
+            lastError: null,
+          });
+        } catch (e) {
+          console.warn('Failed to update progression state after followup send (read-modify-write)', e);
         }
       }
 
@@ -897,7 +1344,7 @@ const worker = new Worker(
 
       try {
         await incrementStats(domain, false, campaignId);
-      } catch (_) {}
+      } catch (_) { }
 
       const lowerMsg = String(message).toLowerCase();
       const throttlingIndicators = ['rate limit', 'throttl', 'too many', 'blocked', 'limit exceeded', 'try again later'];
@@ -910,9 +1357,9 @@ const worker = new Worker(
         const nextAttemptsEstimate = (beforeRow?.bgAttempts || 0) + 1;
         const failRate = await getDomainFailureRate(domain);
         const ttl = Math.min(60 * 60, Math.max(30, Math.round(DOMAIN_BLOCK_TTL_SEC * (1 + nextAttemptsEstimate * 0.5 + failRate * 4))));
-        try { await setDomainBlock(domain, ttl, `smtp:${smtpCode} msg:${message}`); } catch (e) {}
+        try { await setDomainBlock(domain, ttl, `smtp:${smtpCode} msg:${message}`); } catch (e) { }
         if (lowerMsg.includes('rate limit') || Number(smtpCode) === 421) {
-          try { await setGlobalBlock(Math.min(60 * 60, GLOBAL_BLOCK_TTL_SEC), `smtp:${smtpCode}`); } catch (e) {}
+          try { await setGlobalBlock(Math.min(60 * 60, GLOBAL_BLOCK_TTL_SEC), `smtp:${smtpCode}`); } catch (e) { }
         }
       }
 
@@ -924,6 +1371,26 @@ const worker = new Worker(
         bgAttempts: currentAttempt,
       };
 
+      try {
+        if (isFollowup && idx != null) {
+          // Ensure current step bg attempts updated
+          updateFields.currentStepBgAttempts = currentAttempt;
+          // If ledgerRow already pointed to this step, keep/increment currentStepAttempts; otherwise set to 1
+          const ledgerCurrentIdx = normalizeIndex(ledgerRow.currentStepIndex);
+          const prevStepAttempts = typeof ledgerRow.currentStepAttempts === 'number' ? ledgerRow.currentStepAttempts : 0;
+          const nextStepAttempts = (ledgerCurrentIdx === idx) ? (prevStepAttempts) : (prevStepAttempts || 1);
+          // In most cases the sending pre-flight already incremented currentStepAttempts. We'll avoid double-increment here.
+          updateFields.currentStepAttempts = ledgerRow.currentStepAttempts ?? nextStepAttempts;
+          // Mirror to attempts field for UI
+          updateFields.attempts = updateFields.currentStepAttempts;
+          // Also ensure currentStepIndex/name recorded
+          updateFields.currentStepIndex = idx;
+          updateFields.currentStepName = stepDef?.name ?? ledgerRow.currentStepName ?? `Follow up ${idx}`;
+        }
+      } catch (e) {
+        console.warn('Error preparing followup-scoped failure fields', e);
+      }
+
       if (currentAttempt < MAX_ATTEMPTS) {
         updateFields.status = 'sending';
         try {
@@ -932,13 +1399,26 @@ const worker = new Worker(
           console.warn('Failed to persist intermediate failure state', e);
         }
 
-        await publishContactUpdate(campaignId, contactId, {
-          status: updateFields.status,
-          attempts: ledgerRow.attempts ?? 0,
-          bgAttempts: currentAttempt,
-          lastAttemptAt: updateFields.lastAttemptAt.toISOString(),
-          lastError: updateFields.lastError,
-        });
+        // read back ledger to ensure published values are canonical
+        try {
+          const ledgerAfter = await db.collection('campaign_contacts').findOne(ledgerFilter);
+          const publishPayload: any = {
+            status: updateFields.status,
+            attempts: ledgerAfter?.attempts ?? 0,
+            bgAttempts: ledgerAfter?.bgAttempts ?? currentAttempt,
+            lastAttemptAt: ledgerAfter?.lastAttemptAt ? new Date(ledgerAfter.lastAttemptAt).toISOString() : (new Date()).toISOString(),
+            lastError: updateFields.lastError,
+          };
+          if (isFollowup && idx != null) {
+            publishPayload.currentStepIndex = ledgerAfter?.currentStepIndex ?? idx;
+            publishPayload.currentStepName = ledgerAfter?.currentStepName ?? stepDef?.name ?? null;
+            publishPayload.currentStepAttempts = ledgerAfter?.currentStepAttempts ?? updateFields.currentStepAttempts;
+            publishPayload.currentStepBgAttempts = ledgerAfter?.currentStepBgAttempts ?? updateFields.currentStepBgAttempts;
+          }
+          await publishContactUpdate(campaignId, contactId, publishPayload);
+        } catch (e) {
+          console.warn('Failed to publish intermediate failure contact update', e);
+        }
 
         throw err;
       } else {
@@ -952,15 +1432,28 @@ const worker = new Worker(
         try {
           await redis.hincrby(`campaign:${campaignId}:meta`, 'processed', 1);
           await redis.hincrby(`campaign:${campaignId}:meta`, 'failed', 1);
-        } catch (_) {}
+        } catch (_) { }
 
-        await publishContactUpdate(campaignId, contactId, {
-          status: 'failed',
-          attempts: ledgerRow.attempts ?? 0,
-          bgAttempts: currentAttempt,
-          lastAttemptAt: updateFields.lastAttemptAt.toISOString(),
-          lastError: updateFields.lastError,
-        });
+        // read back ledger then publish accurate failure state
+        try {
+          const ledgerAfter = await db.collection('campaign_contacts').findOne(ledgerFilter);
+          const publishPayload: any = {
+            status: 'failed',
+            attempts: ledgerAfter?.attempts ?? (updateFields.attempts ?? 0),
+            bgAttempts: ledgerAfter?.bgAttempts ?? currentAttempt,
+            lastAttemptAt: ledgerAfter?.lastAttemptAt ? new Date(ledgerAfter.lastAttemptAt).toISOString() : (new Date()).toISOString(),
+            lastError: updateFields.lastError,
+          };
+          if (isFollowup && idx != null) {
+            publishPayload.currentStepIndex = ledgerAfter?.currentStepIndex ?? idx;
+            publishPayload.currentStepName = ledgerAfter?.currentStepName ?? stepDef?.name ?? null;
+            publishPayload.currentStepAttempts = ledgerAfter?.currentStepAttempts ?? updateFields.currentStepAttempts;
+            publishPayload.currentStepBgAttempts = ledgerAfter?.currentStepBgAttempts ?? updateFields.currentStepBgAttempts;
+          }
+          await publishContactUpdate(campaignId, contactId, publishPayload);
+        } catch (e) {
+          console.warn('Failed to publish final failed contact update', e);
+        }
 
         // Try to finalize (this failure might make processed==total)
         await finalizeCampaign(campaignId);

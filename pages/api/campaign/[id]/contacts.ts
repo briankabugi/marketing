@@ -149,8 +149,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           ]).toArray();
 
           for (const o of openAgg) {
-            const key = o._1?._toString ? o._1.toString() : (o._id && o._id.toString ? o._id.toString() : String(o._id));
-            // Some drivers may return _id as an ObjectId or primitive; normalize
             const k = (o._id && o._id.toString) ? o._id.toString() : String(o._id);
             openLookup[k] = o.lastOpenAt ? (new Date(o.lastOpenAt)).toISOString() : null;
           }
@@ -181,6 +179,54 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
+    // -------------------------
+    // NEW: aggregate followup_sent & followup_skipped events for these page contactIds
+    // -------------------------
+    const followupLookup: Record<string, { completed: number; lastSkippedAt?: string | null; lastSkippedReason?: string | null }> = {};
+    try {
+      if (contactIdValues.length > 0) {
+        // Build contact match clauses that accept ObjectId or string ids
+        const contactMatchClauses: any[] = [];
+        if (contactObjIds.length) contactMatchClauses.push({ contactId: { $in: contactObjIds } });
+        if (stringContactIds.length) contactMatchClauses.push({ contactId: { $in: stringContactIds } });
+
+        if (contactMatchClauses.length > 0) {
+          const campaignIdMatch: any = campaignIdObj ? { $or: [{ campaignId: campaignIdObj }, { campaignId: campaignIdStr }] } : { campaignId: campaignIdStr };
+
+          const fuAgg = await db.collection('campaign_events').aggregate([
+            { $match: { $and: [ campaignIdMatch, { type: { $in: ['followup_sent', 'followup_skipped'] } }, { $or: contactMatchClauses } ] } },
+            { $group: {
+                _id: '$contactId',
+                completed: { $sum: 1 },
+                lastSkippedAt: { $max: { $cond: [ { $eq: ['$type', 'followup_skipped'] }, '$createdAt', null ] } },
+                lastSkippedReason: { $max: { $cond: [ { $eq: ['$type', 'followup_skipped'] }, '$skippedReason', null ] } }
+              }
+            }
+          ]).toArray();
+
+          for (const f of fuAgg) {
+            const k = (f._id && f._id.toString) ? f._id.toString() : String(f._id);
+            followupLookup[k] = {
+              completed: (typeof f.completed === 'number' ? f.completed : Number(f.completed || 0)),
+              lastSkippedAt: f.lastSkippedAt ? (new Date(f.lastSkippedAt)).toISOString() : null,
+              lastSkippedReason: f.lastSkippedReason ?? null,
+            };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to aggregate followup events for contacts page', e);
+    }
+
+    // Fetch campaign document to know how many followups are configured (safe fallback)
+    let campaignDoc: any = null;
+    try {
+      campaignDoc = await db.collection('campaigns').findOne({ _id: campaignIdObj ?? campaignIdStr });
+    } catch (e) {
+      // ignore
+    }
+    const followUpCount = Array.isArray(campaignDoc?.followUps) ? campaignDoc.followUps.length : 0;
+
     // Build response items
     const items = rows.map((r: any) => {
       const cidKey = r.contactId && r.contactId.toString ? r.contactId.toString() : String(r.contactId ?? '');
@@ -190,11 +236,73 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       const lastOpenAt = openLookup[cidKey] ?? null;
       const lastClickAt = clickLookup[cidKey] ?? null;
 
+      const fuInfo = followupLookup[cidKey] ?? { completed: 0 };
+
+      // Prefer ledger followUpPlan when present for accurate progression
+      const ledgerPlan = Array.isArray(r.followUpPlan) ? r.followUpPlan : null;
+      let completedFromLedger: number | null = null;
+      let lastSkippedAtFromLedger: string | null = null;
+      let lastSkippedReasonFromLedger: string | null = null;
+      let planCountLocal = followUpCount;
+
+      if (ledgerPlan) {
+        planCountLocal = ledgerPlan.length;
+        completedFromLedger = ledgerPlan.filter((p: any) => {
+          if (p == null) return false;
+          const status = (p.status || '').toString().toLowerCase();
+          if (status === 'sent' || !!p.sentAt) return true;
+          return false;
+        }).length;
+
+        // find last skipped entry if any
+        const skippedEntries = ledgerPlan.filter((p: any) => (p && (p.status === 'skipped' || p.skippedAt)));
+        if (skippedEntries.length) {
+          // pick latest skippedAt (if present) else null
+          const latest = skippedEntries.reduce((acc: any, cur: any) => {
+            const curDate = cur.skippedAt ? new Date(cur.skippedAt) : null;
+            if (!acc) return cur;
+            const accDate = acc.skippedAt ? new Date(acc.skippedAt) : null;
+            if (curDate && accDate) return curDate.getTime() > accDate.getTime() ? cur : acc;
+            if (curDate && !accDate) return cur;
+            return acc;
+          }, null);
+          if (latest) {
+            lastSkippedAtFromLedger = latest.skippedAt ? (new Date(latest.skippedAt)).toISOString() : null;
+            lastSkippedReasonFromLedger = latest.skippedReason ?? null;
+          }
+        }
+      }
+
+      const completed = (typeof completedFromLedger === 'number') ? completedFromLedger : (fuInfo.completed ?? 0);
+      const nextStep = (typeof completed === 'number' && completed < (planCountLocal || 0)) ? (completed + 1) : null;
+
+      // Normalize followUpPlan for API output (convert Date-like to ISO strings)
+      const followUpPlanOut = (ledgerPlan || []).map((p: any) => {
+        return {
+          index: p.index ?? null,
+          name: p.name ?? null,
+          rule: p.rule ?? null,
+          status: p.status ?? null,
+          scheduledFor: p.scheduledFor ? (new Date(p.scheduledFor)).toISOString() : (p.scheduledFor ? String(p.scheduledFor) : null),
+          sentAt: p.sentAt ? (new Date(p.sentAt)).toISOString() : null,
+          skippedAt: p.skippedAt ? (new Date(p.skippedAt)).toISOString() : null,
+          skippedReason: p.skippedReason ?? null,
+          delayMinutes: typeof p.delayMinutes === 'number' ? p.delayMinutes : (p.delayMinutes ? Number(p.delayMinutes) : null),
+        };
+      });
+
+      // Step-scoped counters (new model): prefer explicit currentStep fields if present, otherwise fall back.
+      const currentStepIndex = (typeof r.currentStepIndex === 'number' || (r.currentStepIndex != null)) ? Number(r.currentStepIndex) : (r.currentStepIndex ? Number(r.currentStepIndex) : null);
+      const currentStepName = r.currentStepName ?? null;
+      const currentStepAttempts = typeof r.currentStepAttempts === 'number' ? r.currentStepAttempts : (typeof r.attempts === 'number' ? r.attempts : 0);
+      const currentStepBgAttempts = typeof r.currentStepBgAttempts === 'number' ? r.currentStepBgAttempts : (typeof r.bgAttempts === 'number' ? r.bgAttempts : 0);
+
       return {
         id: r._id?.toString?.() ?? String(r._id),
         contactId: r.contactId && r.contactId.toString ? r.contactId.toString() : String(r.contactId ?? null),
         email,
         status: r.status ?? null,
+        // attempts reflect active step attempts under the new model; keep explicit fields as well
         attempts: typeof r.attempts === 'number' ? r.attempts : 0,
         bgAttempts: typeof r.bgAttempts === 'number' ? r.bgAttempts : 0,
         lastAttemptAt: r.lastAttemptAt ? new Date(r.lastAttemptAt).toISOString() : null,
@@ -203,6 +311,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         lastOpenAt,
         clicked: !!lastClickAt,
         lastClickAt,
+        // replies (existing)
+        replied: !!(r.replied || r.repliesCount || r.lastReplyAt),
+        lastReplyAt: r.lastReplyAt ?? null,
+        lastReplySnippet: r.lastReplySnippet ?? null,
+        repliesCount: typeof r.repliesCount === 'number' ? r.repliesCount : (r.replied ? 1 : 0),
+        // followup progress (new / improved)
+        followupsCompleted: completed,
+        nextFollowUpStep: nextStep, // 1-based index or null
+        // ledger-backed plan + progression fields
+        followUpPlan: followUpPlanOut,
+        nextFollowUpAt: r.nextFollowUpAt ? (new Date(r.nextFollowUpAt)).toISOString() : null,
+        followUpStatus: r.followUpStatus ?? null,
+        lastStepSentAt: r.lastStepSentAt ? (new Date(r.lastStepSentAt)).toISOString() : null,
+        currentStepIndex,
+        currentStepName,
+        currentStepAttempts,
+        currentStepBgAttempts,
+        // skipped info: prefer ledger values, fall back to aggregated events
+        lastFollowupSkippedAt: lastSkippedAtFromLedger ?? (fuInfo.lastSkippedAt ?? null),
+        lastFollowupSkippedReason: lastSkippedReasonFromLedger ?? (fuInfo.lastSkippedReason ?? null),
       };
     });
 

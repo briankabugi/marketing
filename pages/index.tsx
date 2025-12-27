@@ -19,6 +19,15 @@ type AttachmentEntry = {
   source?: 'url' | 'path' | 'content';
 };
 
+type FollowUpDraft = {
+  id: string; // client-side id
+  delayValue: number;
+  delayUnit: 'minutes' | 'hours' | 'days';
+  subject: string;
+  body: string;
+  attachments: AttachmentEntry[];
+};
+
 export default function Dashboard() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,11 +43,26 @@ export default function Dashboard() {
   const [previewCount, setPreviewCount] = useState<number | null>(null);
   const [previewSample, setPreviewSample] = useState<string[]>([]);
 
-  // attachments state for the new campaign
+  // attachments state for the new campaign (initial)
   const [attachments, setAttachments] = useState<AttachmentEntry[]>([]);
   const [uploading, setUploading] = useState(false);
   const [urlToAdd, setUrlToAdd] = useState('');
   const [urlName, setUrlName] = useState('');
+
+  // Follow-ups: dynamic editor
+  const [followUps, setFollowUps] = useState<FollowUpDraft[]>([]);
+
+  // convenience: create a fresh followup draft
+  function newFollowUpDraft(): FollowUpDraft {
+    return {
+      id: String(Date.now()) + '-' + Math.floor(Math.random() * 100000),
+      delayValue: 1,
+      delayUnit: 'days',
+      subject: '',
+      body: '',
+      attachments: [],
+    };
+  }
 
   async function loadCampaigns() {
     try {
@@ -69,6 +93,16 @@ export default function Dashboard() {
     return () => clearInterval(i);
   }, []);
 
+  // convert a delay value/unit to minutes
+  function delayToMinutes(value: number, unit: 'minutes' | 'hours' | 'days') {
+    const v = Number(value) || 0;
+    if (v <= 0) return 0;
+    if (unit === 'minutes') return Math.round(v);
+    if (unit === 'hours') return Math.round(v * 60);
+    return Math.round(v * 60 * 24);
+  }
+
+  // Preview campaign: call server preview endpoint
   async function previewCampaign() {
     if (!name || !subject || !body) {
       alert('Please fill name, subject and body to preview.');
@@ -80,10 +114,24 @@ export default function Dashboard() {
       return;
     }
 
+    // prepare followups in the original model shape (top-level followUps with delayMinutes)
+    const normalizedFollowUps = followUps.map(f => ({
+      delayMinutes: delayToMinutes(f.delayValue, f.delayUnit),
+      subject: f.subject,
+      body: f.body,
+      attachments: f.attachments.map(a => ({
+        name: a.name,
+        source: a.source ?? 'url',
+        url: a.url,
+        contentType: a.contentType ?? undefined,
+      })),
+    }));
+
     const payload = {
+      name,
       contacts: contactType === 'all' ? { type: 'all' } : { type: 'segment', value: segment },
       initial: { subject, body, attachments },
-      followUps: [],
+      followUps: normalizedFollowUps,
     };
 
     const res = await fetch('/api/campaign/preview', {
@@ -103,6 +151,7 @@ export default function Dashboard() {
     setPreviewSample(data.sample || []);
   }
 
+  // Start campaign: send start request to server using original model (top-level followUps)
   async function startCampaign() {
     if (!name || !subject || !body) {
       alert('Please fill name, subject and body.');
@@ -114,20 +163,37 @@ export default function Dashboard() {
       return;
     }
 
-    // normalize attachments to include "source" so server validation passes
-    const normalized = attachments.map(a => ({
-      name: a.name,
-      source: a.source ?? 'url',
-      url: a.url,
-      contentType: a.contentType ?? undefined,
-      // note: start.ts will accept url/path/content per its validator
+    // validate followups: ensure non-empty subject/body and positive delay
+    for (const f of followUps) {
+      if (!f.subject && !f.body) {
+        alert('Each follow-up must have at least a subject or body.');
+        return;
+      }
+      const dm = delayToMinutes(f.delayValue, f.delayUnit);
+      if (dm <= 0) {
+        alert('Follow-up delays must be greater than zero.');
+        return;
+      }
+    }
+
+    // normalize followups for API (original shape expected by your worker)
+    const normalizedFollowUps = followUps.map(f => ({
+      delayMinutes: delayToMinutes(f.delayValue, f.delayUnit),
+      subject: f.subject,
+      body: f.body,
+      attachments: f.attachments.map(a => ({
+        name: a.name,
+        source: a.source ?? 'url',
+        url: a.url,
+        contentType: a.contentType ?? undefined,
+      })),
     }));
 
     const payload = {
       name,
       contacts: contactType === 'all' ? { type: 'all' } : { type: 'segment', value: segment },
-      initial: { subject, body, attachments: normalized },
-      followUps: [], // extend later with UI for follow-ups
+      initial: { subject, body, attachments },
+      followUps: normalizedFollowUps,
     };
 
     const res = await fetch('/api/campaign/start', {
@@ -152,12 +218,14 @@ export default function Dashboard() {
     setPreviewSample([]);
     setShowForm(false);
     setAttachments([]);
+    setFollowUps([]);
     loadCampaigns();
     loadSegments();
   }
 
   // Helper: upload a file to server (base64)
-  async function uploadFile(file: File) {
+  // target: undefined => initial attachments; { type: 'followup', idx } => followup attachments for followUps[idx]
+  async function uploadFile(file: File, target?: { type: 'followup'; idx: number } | undefined) {
     setUploading(true);
     try {
       const reader = new FileReader();
@@ -197,8 +265,26 @@ export default function Dashboard() {
       });
 
       const result = await p;
-      // add to attachments; mark source as 'url' because uploaded files are hosted under /uploads
-      setAttachments((cur) => [...cur, { name: file.name, url: result.url, contentType: result.contentType ?? null, size: result.size, source: 'url' }]);
+
+      const entry: AttachmentEntry = {
+        name: file.name,
+        url: result.url,
+        contentType: result.contentType ?? null,
+        size: result.size,
+        source: 'url',
+      };
+
+      if (!target) {
+        setAttachments((cur) => [...cur, entry]);
+      } else {
+        setFollowUps(cur => {
+          const copy = [...cur];
+          const fu = copy[target.idx];
+          if (!fu) return cur;
+          fu.attachments = [...fu.attachments, entry];
+          return copy;
+        });
+      }
     } catch (e: any) {
       console.error('Upload failed', e);
       alert('Upload failed: ' + (e?.message || String(e)));
@@ -207,16 +293,25 @@ export default function Dashboard() {
     }
   }
 
-  function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
+  function handleInitialFileInput(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-    // upload each file sequentially to limit concurrency
     (async () => {
       for (let i = 0; i < files.length; i++) {
         await uploadFile(files[i]);
       }
     })();
-    // reset input
+    e.currentTarget.value = '';
+  }
+
+  function handleFollowUpFileInput(e: React.ChangeEvent<HTMLInputElement>, idx: number) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    (async () => {
+      for (let i = 0; i < files.length; i++) {
+        await uploadFile(files[i], { type: 'followup', idx });
+      }
+    })();
     e.currentTarget.value = '';
   }
 
@@ -228,22 +323,18 @@ export default function Dashboard() {
     });
   }
 
-  // Add an external URL as an attachment (source = 'url')
-  function isValidUrl(u: string) {
-    try {
-      const parsed = new URL(u);
-      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
-    } catch {
-      return false;
-    }
-  }
-
   function addUrlAttachment() {
     if (!urlToAdd) {
       alert('Paste a URL first');
       return;
     }
-    if (!isValidUrl(urlToAdd.trim())) {
+    try {
+      const u = new URL(urlToAdd.trim());
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        alert('Invalid URL (must be http or https)');
+        return;
+      }
+    } catch {
       alert('Invalid URL (must be http or https)');
       return;
     }
@@ -253,6 +344,65 @@ export default function Dashboard() {
     setUrlName('');
   }
 
+  // FollowUp helpers
+  function addFollowUp() {
+    setFollowUps(cur => [...cur, newFollowUpDraft()]);
+  }
+
+  function removeFollowUp(idx: number) {
+    setFollowUps(cur => {
+      const copy = [...cur];
+      copy.splice(idx, 1);
+      return copy;
+    });
+  }
+
+  function updateFollowUp(idx: number, patch: Partial<FollowUpDraft>) {
+    setFollowUps(cur => {
+      const copy = [...cur];
+      if (!copy[idx]) return cur;
+      copy[idx] = { ...copy[idx], ...patch };
+      return copy;
+    });
+  }
+
+  function addUrlAttachmentToFollowUp(idx: number, url: string, name?: string) {
+    if (!url) return;
+    try {
+      const u = new URL(url.trim());
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        alert('Invalid URL (must be http or https)');
+        return;
+      }
+    } catch {
+      alert('Invalid URL (must be http or https)');
+      return;
+    }
+    const displayName = name?.trim() || new URL(url).pathname.split('/').filter(Boolean).pop() || url;
+    const entry: AttachmentEntry = { name: displayName, url: url.trim(), contentType: null, source: 'url' };
+    setFollowUps(cur => {
+      const copy = [...cur];
+      if (!copy[idx]) return cur;
+      copy[idx].attachments = [...copy[idx].attachments, entry];
+      return copy;
+    });
+  }
+
+  function removeFollowUpAttachment(fuIdx: number, attIdx: number) {
+    setFollowUps(cur => {
+      const copy = [...cur];
+      if (!copy[fuIdx]) return cur;
+      const arr = [...copy[fuIdx].attachments];
+      arr.splice(attIdx, 1);
+      copy[fuIdx].attachments = arr;
+      return copy;
+    });
+  }
+
+  // Add a remote URL attachment to a follow-up (inline UI will pass values)
+  // Note: we will use small inline inputs per followup below.
+
+  // UI render
   return (
     <div style={{ padding: 24, fontFamily: 'sans-serif' }}>
       <h1>Marketing MVP Dashboard</h1>
@@ -268,7 +418,7 @@ export default function Dashboard() {
             padding: 16,
             marginTop: 12,
             borderRadius: 6,
-            maxWidth: 680,
+            maxWidth: 900,
           }}
         >
           <h3>New Campaign</h3>
@@ -333,10 +483,10 @@ export default function Dashboard() {
           )}
 
           <div style={{ marginTop: 8 }}>
-            <div style={{ marginBottom: 6, fontWeight: 600 }}>Attachments</div>
+            <div style={{ marginBottom: 6, fontWeight: 600 }}>Attachments (Initial Message)</div>
 
             <div style={{ marginBottom: 8 }}>
-              <input type="file" multiple onChange={handleFileInput} />
+              <input type="file" multiple onChange={handleInitialFileInput} />
               <div style={{ marginTop: 6, fontSize: 13, color: '#666' }}>
                 Files uploaded are stored under <code>/public/uploads</code> and included as URL attachments.
               </div>
@@ -376,6 +526,101 @@ export default function Dashboard() {
                 </ul>
               )}
             </div>
+          </div>
+
+          {/* Follow-ups editor */}
+          <div style={{ marginTop: 16, borderTop: '1px dashed #ddd', paddingTop: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h4 style={{ margin: 0 }}>Follow-ups</h4>
+              <div>
+                <button onClick={addFollowUp}>+ Add follow-up</button>
+              </div>
+            </div>
+
+            {followUps.length === 0 && (
+              <div style={{ marginTop: 8, color: '#666' }}>
+                No follow-ups configured (optional). Add follow-ups to automatically send subsequent messages.
+              </div>
+            )}
+
+            {followUps.map((f, idx) => (
+              <div key={f.id} style={{ marginTop: 12, border: '1px solid #eee', padding: 12, borderRadius: 6 }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: 13 }}>Delay</label>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <input
+                        type="number"
+                        min={1}
+                        value={f.delayValue}
+                        onChange={(e) => updateFollowUp(idx, { delayValue: Number(e.target.value || 0) })}
+                        style={{ width: 100 }}
+                      />
+                      <select
+                        value={f.delayUnit}
+                        onChange={(e) => updateFollowUp(idx, { delayUnit: e.target.value as any })}
+                      >
+                        <option value="minutes">minutes</option>
+                        <option value="hours">hours</option>
+                        <option value="days">days</option>
+                      </select>
+                    </div>
+                    <div style={{ fontSize: 12, color: '#666', marginTop: 6 }}>
+                      Time after original send when this follow-up will be evaluated.
+                    </div>
+                  </div>
+
+                  <div style={{ flex: 1 }}>
+                    <label style={{ display: 'block', fontSize: 13 }}>Subject</label>
+                    <input
+                      value={f.subject}
+                      onChange={(e) => updateFollowUp(idx, { subject: e.target.value })}
+                      style={{ width: '100%', marginBottom: 6 }}
+                      placeholder="Follow-up subject (optional)"
+                    />
+                    <label style={{ display: 'block', fontSize: 13 }}>Body</label>
+                    <textarea
+                      value={f.body}
+                      onChange={(e) => updateFollowUp(idx, { body: e.target.value })}
+                      rows={4}
+                      style={{ width: '100%' }}
+                      placeholder="Follow-up body (HTML allowed)"
+                    />
+                  </div>
+
+                  <div style={{ minWidth: 80 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <button onClick={() => removeFollowUp(idx)} style={{ background: '#fff', border: '1px solid #ddd' }}>Remove</button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Attachments for this follow-up */}
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ marginBottom: 6, fontWeight: 600 }}>Attachments (for this follow-up)</div>
+                  <div style={{ marginBottom: 6 }}>
+                    <input type="file" multiple onChange={(e) => handleFollowUpFileInput(e, idx)} />
+                  </div>
+
+                  <FollowUpUrlAttachmentInput idx={idx} onAdd={(url, name) => addUrlAttachmentToFollowUp(idx, url, name)} />
+
+                  <div style={{ marginTop: 8 }}>
+                    {f.attachments.length === 0 && <div style={{ color: '#666', fontSize: 13 }}>No attachments</div>}
+                    {f.attachments.length > 0 && (
+                      <ul>
+                        {f.attachments.map((a, aidx) => (
+                          <li key={String(a.url) + aidx} style={{ marginBottom: 6 }}>
+                            <a href={a.url} target="_blank" rel="noreferrer">{a.name}</a>
+                            {a.size ? <span style={{ marginLeft: 8, color: '#666', fontSize: 13 }}>{Math.round((a.size||0)/1024)} KB</span> : null}
+                            <button style={{ marginLeft: 8 }} onClick={() => removeFollowUpAttachment(idx, aidx)}>Remove</button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
 
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
@@ -434,6 +679,25 @@ export default function Dashboard() {
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * Helper component: small inputs for adding a URL attachment to a given follow-up.
+ * Keeps that logic modular to keep main file tidy.
+ */
+function FollowUpUrlAttachmentInput({ idx, onAdd }: { idx: number; onAdd: (url: string, name?: string) => void }) {
+  const [u, setU] = useState('');
+  const [n, setN] = useState('');
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ fontSize: 13, marginBottom: 6 }}>Or add a remote URL for this follow-up</div>
+      <input placeholder="https://example.com/file.pdf" value={u} onChange={(e) => setU(e.target.value)} style={{ width: '100%', marginBottom: 6 }} />
+      <input placeholder="Optional display filename" value={n} onChange={(e) => setN(e.target.value)} style={{ width: '100%', marginBottom: 6 }} />
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button onClick={() => { onAdd(u.trim(), n.trim() || undefined); setU(''); setN(''); }}>Add URL attachment</button>
+      </div>
     </div>
   );
 }

@@ -1,3 +1,4 @@
+// pages/api/campaign/[id]/control.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 import clientPromise from '../../../../lib/mongo';
 import { redis } from '../../../../lib/redis';
