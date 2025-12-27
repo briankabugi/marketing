@@ -761,7 +761,7 @@ const worker = new Worker(
         trackedHtml = rewriteLinksForTracking(trackedHtml, campaignId, contactId);
 
         // 3) inject open pixel
-        trackedHtml = injectOpenPixel(trackedHtml, campaignId, contactId);
+        // trackedHtml = injectOpenPixel(trackedHtml, campaignId, contactId);
       }
     } catch (e) {
       console.warn('Failed to rewrite or inject tracking into HTML, falling back to original body', e);
